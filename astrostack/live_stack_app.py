@@ -33,7 +33,7 @@ from typing import Optional, Tuple, Callable, List, Dict, Union
 
 import numpy as np
 import cv2
-import pyPOACamera
+from . import pyPOACamera
 
 cv2.setUseOptimized(True)
 

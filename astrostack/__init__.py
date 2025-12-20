@@ -1,0 +1,2 @@
+"""AstroStack package."""
+

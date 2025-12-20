@@ -37,7 +37,7 @@ from astropy.coordinates import SkyCoord, Angle
 from astroquery.simbad import Simbad
 
 # Módulo con caché HEALPix para Gaia
-from gaia_cache import normalize_input, gaia_healpix_cone_with_mag
+from .gaia_cache import normalize_input, gaia_healpix_cone_with_mag
 
 # ----------------------------- CONFIG NOMBRES SIMBAD --------------
 _NAME_CACHE_DIR = Path(os.environ.get("GAIA_NAME_CACHE_DIR", "~/.cache/gaia_names")).expanduser()

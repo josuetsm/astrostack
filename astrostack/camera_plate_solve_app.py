@@ -22,7 +22,7 @@ import numpy as np
 import cv2
 import pyPOACamera
 
-from plate_solve_pipeline import run_pipeline
+from .plate_solve_pipeline import run_pipeline
 
 
 # ----------------------------- POA helpers -----------------------------

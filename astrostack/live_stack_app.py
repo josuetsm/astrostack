@@ -1070,10 +1070,6 @@ def main(outdir: str = "captures", roi: int = 1024, binning: int = 1):
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    cam_id, props = pick_first_camera()
-    model = props.cameraModelName.decode(errors="ignore").strip("\x00") if isinstance(props.cameraModelName, (bytes, bytearray)) else str(props.cameraModelName)
-    is_color = bool(props.isColorCamera)
-
     cfg = StackConfig(roi=roi)
     stacker = LiveStacker(cfg)
     p = Params()
@@ -1081,6 +1077,18 @@ def main(outdir: str = "captures", roi: int = 1024, binning: int = 1):
     running = {"quit": False}
     saved = {"stack": 0, "live": 0}
     last_live_holder = {"bgr": np.zeros((roi, roi, 3), dtype=np.uint8)}
+    camera = {
+        "connected": False,
+        "cam_id": None,
+        "props": None,
+        "model": "Sin camara",
+        "is_color": False,
+        "iw": roi,
+        "ih": roi,
+        "fmt": None,
+        "buf": None,
+    }
+    started = False
 
     # Window size (safe default)
     pad = 12
@@ -1109,7 +1117,13 @@ def main(outdir: str = "captures", roi: int = 1024, binning: int = 1):
         print("Saved", fname)
 
     def act_quit(): running["quit"] = True
+    def act_connect():
+        if camera["connected"]:
+            disconnect_camera("Camara desconectada.")
+        else:
+            connect_camera()
 
+    ui.add_button(Button("connect", "Conectar", (0, 0, 1, 1), act_connect, tooltip="Conecta/desconecta la camara."))
     ui.add_button(Button("reset", "Reset", (0, 0, 1, 1), act_reset, tooltip="Reinicia referencia y acumulador."))
     ui.add_button(Button("pause", "Pause", (0, 0, 1, 1), act_pause, tooltip="Pausa/continua el acumulado.", toggled=lambda: stacker.paused))
     ui.add_button(Button("savestack", "SaveStack", (0, 0, 1, 1), act_save_stack, tooltip="Guarda el stack actual (PNG 8-bit)."))
@@ -1229,16 +1243,14 @@ def main(outdir: str = "captures", roi: int = 1024, binning: int = 1):
         vmin=0.5, vmax=3.0, step=0.05, step_fast=0.20, fmt="{:.2f}"
     ))
 
-    # Camera open/init
-    ensure_ok(pyPOACamera.OpenCamera(cam_id), "OpenCamera")
-    started = False
-
     # Debounce apply
     last_apply_t = 0.0
     last_applied = {"exp_ms": None, "gain": None, "gain_auto": None}
 
     def apply_camera_settings(force: bool = False):
         nonlocal last_apply_t
+        if not camera["connected"] or camera["cam_id"] is None:
+            return
         now = time.time()
         if not force and (now - last_apply_t) < 0.20:
             return
@@ -1257,6 +1269,7 @@ def main(outdir: str = "captures", roi: int = 1024, binning: int = 1):
 
         exp_us = int(exp_ms * 1000)
         try:
+            cam_id = camera["cam_id"]
             ensure_ok(pyPOACamera.SetExp(cam_id, exp_us, False), "SetExp")
             ensure_ok(pyPOACamera.SetGain(cam_id, int(gain), bool(gain_auto)), "SetGain")
             last_applied["exp_ms"] = exp_ms
@@ -1266,27 +1279,92 @@ def main(outdir: str = "captures", roi: int = 1024, binning: int = 1):
         except Exception as e:
             print("Warning: apply_camera_settings failed:", repr(e))
 
+    def disconnect_camera(reason: Optional[str] = None):
+        nonlocal started
+        if started and camera["cam_id"] is not None:
+            try:
+                ensure_ok(pyPOACamera.StopExposure(camera["cam_id"]), "StopExposure")
+            except Exception as e:
+                print("Warning: StopExposure failed:", repr(e))
+        if camera["cam_id"] is not None:
+            err = pyPOACamera.CloseCamera(camera["cam_id"])
+            if err != pyPOACamera.POAErrors.POA_OK:
+                print("Warning: CloseCamera returned error:", pyPOACamera.GetErrorString(err))
+        started = False
+        camera.update({
+            "connected": False,
+            "cam_id": None,
+            "props": None,
+            "model": "Sin camara",
+            "is_color": False,
+            "fmt": None,
+            "buf": None,
+            "iw": roi,
+            "ih": roi,
+        })
+        last_applied.update({"exp_ms": None, "gain": None, "gain_auto": None})
+        last_live_holder["bgr"] = np.zeros((roi, roi, 3), dtype=np.uint8)
+        stacker.reset()
+        if reason:
+            print(reason)
+
+    def connect_camera():
+        nonlocal started
+        if camera["connected"]:
+            return
+        opened = False
+        cam_id = None
+        try:
+            cam_id, props = pick_first_camera()
+            ensure_ok(pyPOACamera.OpenCamera(cam_id), "OpenCamera")
+            opened = True
+            ensure_ok(pyPOACamera.InitCamera(cam_id), "InitCamera")
+            ensure_ok(pyPOACamera.SetImageBin(cam_id, int(binning)), "SetImageBin")
+            roi_w, roi_h, sx, sy = set_centered_roi(cam_id, props, roi, roi)
+
+            # Always RAW8 (for debayer + consistent pipeline)
+            fmt = pyPOACamera.POAImgFormat.POA_RAW8
+            ensure_ok(pyPOACamera.SetImageFormat(cam_id, fmt), "SetImageFormat(RAW8)")
+
+            err, iw, ih = pyPOACamera.GetImageSize(cam_id)
+            ensure_ok(err, "GetImageSize")
+            err, fmt2 = pyPOACamera.GetImageFormat(cam_id)
+            ensure_ok(err, "GetImageFormat")
+            fmt = fmt2
+
+            buf_size = pyPOACamera.ImageCalcSize(ih, iw, fmt)
+            buf = np.zeros(buf_size, dtype=np.uint8)
+
+            camera.update({"connected": True, "cam_id": cam_id})
+            apply_camera_settings(force=True)
+            ensure_ok(pyPOACamera.StartExposure(cam_id, False), "StartExposure(Video)")
+            started = True
+
+            model = props.cameraModelName.decode(errors="ignore").strip("\x00") if isinstance(props.cameraModelName, (bytes, bytearray)) else str(props.cameraModelName)
+            camera.update({
+                "connected": True,
+                "cam_id": cam_id,
+                "props": props,
+                "model": model,
+                "is_color": bool(props.isColorCamera),
+                "iw": iw,
+                "ih": ih,
+                "fmt": fmt,
+                "buf": buf,
+            })
+            last_live_holder["bgr"] = np.zeros((ih, iw, 3), dtype=np.uint8)
+            stacker.reset()
+            print("Camara conectada.")
+        except Exception as e:
+            print("Warning: connect_camera failed:", repr(e))
+            if opened and cam_id is not None:
+                try:
+                    pyPOACamera.CloseCamera(cam_id)
+                except Exception:
+                    pass
+            disconnect_camera()
+
     try:
-        ensure_ok(pyPOACamera.InitCamera(cam_id), "InitCamera")
-        ensure_ok(pyPOACamera.SetImageBin(cam_id, int(binning)), "SetImageBin")
-        roi_w, roi_h, sx, sy = set_centered_roi(cam_id, props, roi, roi)
-
-        # Always RAW8 (for debayer + consistent pipeline)
-        fmt = pyPOACamera.POAImgFormat.POA_RAW8
-        ensure_ok(pyPOACamera.SetImageFormat(cam_id, fmt), "SetImageFormat(RAW8)")
-
-        err, iw, ih = pyPOACamera.GetImageSize(cam_id)
-        ensure_ok(err, "GetImageSize")
-        err, fmt2 = pyPOACamera.GetImageFormat(cam_id)
-        ensure_ok(err, "GetImageFormat")
-        fmt = fmt2
-
-        buf_size = pyPOACamera.ImageCalcSize(ih, iw, fmt)
-        buf = np.zeros(buf_size, dtype=np.uint8)
-
-        apply_camera_settings(force=True)
-        ensure_ok(pyPOACamera.StartExposure(cam_id, False), "StartExposure(Video)")
-        started = True
 
         t0 = time.time()
         last_report = time.time()
@@ -1316,79 +1394,95 @@ def main(outdir: str = "captures", roi: int = 1024, binning: int = 1):
 
             apply_camera_settings(force=False)
 
-            err, ready = pyPOACamera.ImageReady(cam_id)
-            ensure_ok(err, "ImageReady")
-            if not ready:
-                time.sleep(0.001)
+            if camera["connected"]:
+                cam_id = camera["cam_id"]
+                buf = camera["buf"]
+                iw = camera["iw"]
+                ih = camera["ih"]
+                fmt = camera["fmt"]
+                is_color = camera["is_color"]
+                try:
+                    err, ready = pyPOACamera.ImageReady(cam_id)
+                    ensure_ok(err, "ImageReady")
+                    if not ready:
+                        time.sleep(0.001)
+                    else:
+                        timeout_ms = int(p.exp_ms) + 2500
+                        ensure_ok(pyPOACamera.GetImageData(cam_id, buf, timeout_ms), "GetImageData")
+                        img = pyPOACamera.ImageDataConvert(buf, ih, iw, fmt)  # RAW8 -> (H,W) u8 typically
+
+                        # Build gray + live_bgr using debayer pipeline if color camera
+                        if is_color:
+                            pattern = bayer_opts[int(p.bayer_idx) % len(bayer_opts)]
+                            gray_u8, live_bgr = demosaic_raw8(
+                                raw=img,
+                                pattern=pattern,
+                                want_color=bool(p.debayer),
+                                hq=bool(p.debayer_hq),
+                            )
+                        else:
+                            gray_u8 = ensure_gray_u8(img)
+                            live_bgr = cv2.cvtColor(gray_u8, cv2.COLOR_GRAY2BGR)
+
+                        last_live_holder["bgr"] = live_bgr
+
+                        try:
+                            stacker.process(gray_u8)
+                        except Exception as e:
+                            print("Warning: stacker.process failed:", repr(e))
+                            stacker.state = "LOST"
+                except Exception as e:
+                    print("Warning: camera connection lost:", repr(e))
+                    disconnect_camera("Camara desconectada. Usa el boton Conectar para reconectar.")
+
+            gamma = float(p.gamma)
+
+            # LIVE display
+            live_bgr = last_live_holder["bgr"]
+            if p.live_stretch:
+                lg = cv2.cvtColor(live_bgr, cv2.COLOR_BGR2GRAY)
+                lg = percentile_stretch_u8(lg, 2.0, 99.8)
+                lg = apply_gamma_u8(lg, gamma)
+                live_disp = cv2.cvtColor(lg, cv2.COLOR_GRAY2BGR)
             else:
-                timeout_ms = int(p.exp_ms) + 2500
-                try:
-                    ensure_ok(pyPOACamera.GetImageData(cam_id, buf, timeout_ms), "GetImageData")
-                    img = pyPOACamera.ImageDataConvert(buf, ih, iw, fmt)  # RAW8 -> (H,W) u8 typically
-                except Exception as e:
-                    print("Warning: frame grab failed:", repr(e))
-                    continue
+                live_disp = live_bgr.copy()
 
-                # Build gray + live_bgr using debayer pipeline if color camera
-                if is_color:
-                    pattern = bayer_opts[int(p.bayer_idx) % len(bayer_opts)]
-                    gray_u8, live_bgr = demosaic_raw8(
-                        raw=img,
-                        pattern=pattern,
-                        want_color=bool(p.debayer),
-                        hq=bool(p.debayer_hq),
-                    )
-                else:
-                    gray_u8 = ensure_gray_u8(img)
-                    live_bgr = cv2.cvtColor(gray_u8, cv2.COLOR_GRAY2BGR)
+            # STACK display
+            st_raw = stacker.get_stack_u8(raw=True)
+            if st_raw is None:
+                st_disp = None
+            else:
+                st_disp = percentile_stretch_u8(st_raw, 1.0, 99.5) if p.auto_contrast else st_raw
+                st_disp = apply_gamma_u8(st_disp, gamma)
 
-                last_live_holder["bgr"] = live_bgr
+            now = time.time()
+            if now - last_report > 1.0:
+                dt = now - t0
+                fps_in = stacker.seen / dt if dt > 0 else 0.0
+                fps_acc = stacker.accepted / dt if dt > 0 else 0.0
+                last_report = now
 
-                try:
-                    stacker.process(gray_u8)
-                except Exception as e:
-                    print("Warning: stacker.process failed:", repr(e))
-                    stacker.state = "LOST"
+            model = camera["model"]
+            iw = camera["iw"]
+            ih = camera["ih"]
+            is_color = camera["is_color"]
+            status_right = (
+                f"{model}   ROI={iw}x{ih}   Exp={p.exp_ms}ms   Gain={p.gain}"
+                + ("(A)" if p.gain_auto else "")
+                + f"   Gamma={gamma:.2f}"
+                + (f"   Debayer={p.debayer}({bayer_opts[p.bayer_idx % 4]})" if is_color else "")
+            )
+            footer_right = f"FPS in: {fps_in:.1f}   FPS acc: {fps_acc:.1f}"
 
-                gamma = float(p.gamma)
+            info = stacker.overlay_lines()
+            info.append(f"Gates: sharp>={cfg.min_sharpness:.1f}  lock>={cfg.min_response_lock:.3f}  reacq>={cfg.min_response_reacq:.3f}")
+            info.append(f"MaxShift={cfg.max_shift_frac:.2f}  RefUpd={cfg.update_ref_every_accepted}  StarsMin={cfg.min_star_proxy}  Weight={cfg.use_quality_weight}")
 
-                # LIVE display
-                if p.live_stretch:
-                    lg = cv2.cvtColor(live_bgr, cv2.COLOR_BGR2GRAY)
-                    lg = percentile_stretch_u8(lg, 2.0, 99.8)
-                    lg = apply_gamma_u8(lg, gamma)
-                    live_disp = cv2.cvtColor(lg, cv2.COLOR_GRAY2BGR)
-                else:
-                    live_disp = live_bgr.copy()
+            ui.render(live_disp, st_disp, info[:5], status_right, footer_right, stacker.state)
 
-                # STACK display
-                st_raw = stacker.get_stack_u8(raw=True)
-                if st_raw is None:
-                    st_disp = None
-                else:
-                    st_disp = percentile_stretch_u8(st_raw, 1.0, 99.5) if p.auto_contrast else st_raw
-                    st_disp = apply_gamma_u8(st_disp, gamma)
-
-                now = time.time()
-                if now - last_report > 1.0:
-                    dt = now - t0
-                    fps_in = stacker.seen / dt if dt > 0 else 0.0
-                    fps_acc = stacker.accepted / dt if dt > 0 else 0.0
-                    last_report = now
-
-                status_right = (
-                    f"{model}   ROI={iw}x{ih}   Exp={p.exp_ms}ms   Gain={p.gain}"
-                    + ("(A)" if p.gain_auto else "")
-                    + f"   Gamma={gamma:.2f}"
-                    + (f"   Debayer={p.debayer}({bayer_opts[p.bayer_idx % 4]})" if is_color else "")
-                )
-                footer_right = f"FPS in: {fps_in:.1f}   FPS acc: {fps_acc:.1f}"
-
-                info = stacker.overlay_lines()
-                info.append(f"Gates: sharp>={cfg.min_sharpness:.1f}  lock>={cfg.min_response_lock:.3f}  reacq>={cfg.min_response_reacq:.3f}")
-                info.append(f"MaxShift={cfg.max_shift_frac:.2f}  RefUpd={cfg.update_ref_every_accepted}  StarsMin={cfg.min_star_proxy}  Weight={cfg.use_quality_weight}")
-
-                ui.render(live_disp, st_disp, info[:5], status_right, footer_right, stacker.state)
+            btn = ui._get_button("connect")
+            if btn is not None:
+                btn.label = "Desconectar" if camera["connected"] else "Conectar"
 
             key = ui.poll_key()
             if key != 255:
@@ -1405,29 +1499,16 @@ def main(outdir: str = "captures", roi: int = 1024, binning: int = 1):
             elif key == ord("l"):
                 act_save_live()
 
-        if started:
-            try:
-                ensure_ok(pyPOACamera.StopExposure(cam_id), "StopExposure")
-            except Exception as e:
-                print("Warning: StopExposure failed:", repr(e))
-
-        err, dropped = pyPOACamera.GetDroppedImagesCount(cam_id)
-        if err == pyPOACamera.POAErrors.POA_OK:
-            print(f"Dropped frames (SDK): {dropped}")
+        if camera["connected"] and camera["cam_id"] is not None:
+            err, dropped = pyPOACamera.GetDroppedImagesCount(camera["cam_id"])
+            if err == pyPOACamera.POAErrors.POA_OK:
+                print(f"Dropped frames (SDK): {dropped}")
 
         cv2.destroyAllWindows()
 
     finally:
-        if started:
-            try:
-                pyPOACamera.StopExposure(cam_id)
-            except Exception:
-                pass
-        err = pyPOACamera.CloseCamera(cam_id)
-        if err != pyPOACamera.POAErrors.POA_OK:
-            print("Warning: CloseCamera returned error:", pyPOACamera.GetErrorString(err))
-        else:
-            print("Camera closed.")
+        if camera["connected"] or started:
+            disconnect_camera("Camera closed.")
 
 
 if __name__ == "__main__":

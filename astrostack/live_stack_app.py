@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 import unicodedata
@@ -34,12 +35,14 @@ from typing import Optional, Tuple, Callable, List, Dict, Union
 
 import numpy as np
 import cv2
+from scipy.ndimage import gaussian_filter, binary_dilation, generate_binary_structure
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from astrostack import pyPOACamera
+from astrostack.plate_solve_pipeline import run_pipeline
 
 cv2.setUseOptimized(True)
 
@@ -262,6 +265,254 @@ def clamp(v, lo, hi):
 
 
 # =========================
+# Star detection (background + pooling)
+# =========================
+def mad(x: np.ndarray) -> float:
+    x = np.asarray(x, float)
+    return 1.4826 * np.median(np.abs(x - np.median(x)))
+
+
+def _poly_terms(xx: np.ndarray, yy: np.ndarray, degree: int) -> List[np.ndarray]:
+    terms = [np.ones_like(xx, dtype=np.float64)]
+    if degree >= 1:
+        terms += [xx, yy]
+    if degree >= 2:
+        terms += [xx**2, xx * yy, yy**2]
+    if degree >= 3:
+        terms += [xx**3, (xx**2) * yy, xx * (yy**2), yy**3]
+    return terms
+
+
+def _fit_poly2d(
+    img: np.ndarray,
+    mask: Optional[np.ndarray] = None,
+    degree: int = 3,
+    subsample: int = 1,
+) -> np.ndarray:
+    h, w = img.shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    x0, y0 = (w - 1) / 2.0, (h - 1) / 2.0
+    sx, sy = max(x0, 1.0), max(y0, 1.0)
+    xn, yn = (xx - x0) / sx, (yy - y0) / sy
+
+    sel = np.zeros_like(img, dtype=bool)
+    sel[::subsample, ::subsample] = True
+    sel = sel & (~mask) if mask is not None else sel
+
+    terms = _poly_terms(xn, yn, degree)
+    X = np.vstack([t[sel].ravel() for t in terms]).T
+    y = img[sel].astype(np.float64).ravel()
+    coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+
+    bg = np.zeros_like(img, dtype=np.float64)
+    for c, t in zip(coef, terms):
+        bg += c * t
+    return bg
+
+
+def _detect_sources_mask(
+    img: np.ndarray,
+    k: float = 5.0,
+    smooth_sigma: float = 2.0,
+    dilate_px: int = 2,
+) -> np.ndarray:
+    smooth = gaussian_filter(img, sigma=smooth_sigma)
+    thr = np.median(smooth) + k * mad(smooth)
+    m = smooth > thr
+    if dilate_px > 0:
+        st = generate_binary_structure(2, 1)
+        for _ in range(int(dilate_px)):
+            m = binary_dilation(m, st)
+    return m
+
+
+def subtract_background(
+    img: np.ndarray,
+    degree: int = 3,
+    subsample: int = 1,
+    iters: int = 2,
+    k_bright: float = 6.0,
+    k_faint: float = 3.0,
+    dilate_bright: int = 3,
+    dilate_faint: int = 1,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    mask = _detect_sources_mask(img, k=k_bright, smooth_sigma=2.0, dilate_px=dilate_bright)
+    for _ in range(max(1, iters - 1)):
+        bg = _fit_poly2d(img, mask=mask, degree=degree, subsample=subsample)
+        resid = img - bg
+        mask |= _detect_sources_mask(resid, k=k_faint, smooth_sigma=1.5, dilate_px=dilate_faint)
+
+    bg = _fit_poly2d(img, mask=mask, degree=degree, subsample=subsample)
+    out = img - bg
+    non_mask = ~mask if np.any(~mask) else np.ones_like(img, dtype=bool)
+    out -= np.median(out[non_mask])
+    return out.astype(np.float32), bg.astype(np.float32), mask
+
+
+def conv2d_valid(img: np.ndarray, kernel: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+    out_full = cv2.filter2D(img, -1, kernel)
+    kh, kw = kernel.shape
+    top, bottom = (kh - 1) // 2, kh // 2
+    left, right = (kw - 1) // 2, kw // 2
+    out_valid = out_full[top:(None if bottom == 0 else -bottom),
+                         left:(None if right == 0 else -right)]
+    return out_valid, (top, bottom, left, right)
+
+
+def max_pool2d_with_indices(
+    x: np.ndarray,
+    pool_h: int = 2,
+    pool_w: int = 2,
+) -> Tuple[np.ndarray, np.ndarray]:
+    H, W = x.shape
+    H2 = (H // pool_h) * pool_h
+    W2 = (W // pool_w) * pool_w
+    x = x[:H2, :W2]
+    xb = x.reshape(H2 // pool_h, pool_h, W2 // pool_w, pool_w)
+    pooled = xb.max(axis=(1, 3))
+    flat = xb.reshape(H2 // pool_h, W2 // pool_w, pool_h * pool_w)
+    idx_in_block = flat.argmax(axis=2)
+    return pooled, idx_in_block
+
+
+def pooled_indices_to_image_coords(
+    idx_in_block: np.ndarray,
+    pool_h: int,
+    pool_w: int,
+    offset_top: int,
+    offset_left: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    Hc, Wc = idx_in_block.shape
+    gy, gx = np.meshgrid(np.arange(Hc), np.arange(Wc), indexing="ij")
+    off_y = (idx_in_block // pool_w)
+    off_x = (idx_in_block % pool_w)
+    y_valid = gy * pool_h + off_y
+    x_valid = gx * pool_w + off_x
+    y_img = y_valid + offset_top
+    x_img = x_valid + offset_left
+    return y_img.astype(int), x_img.astype(int)
+
+
+def nms_min_distance(
+    y: np.ndarray,
+    x: np.ndarray,
+    scores: np.ndarray,
+    min_dist: int = 50,
+) -> np.ndarray:
+    order = np.argsort(scores.ravel())[::-1]
+    ys, xs, ss = y[order], x[order], scores[order]
+    keep = []
+    for i in range(len(order)):
+        yi, xi = ys[i], xs[i]
+        too_close = False
+        for j in keep:
+            dy = yi - ys[j]
+            dx = xi - xs[j]
+            if (dy * dy + dx * dx) < (min_dist * min_dist):
+                too_close = True
+                break
+        if not too_close:
+            keep.append(i)
+    return order[np.array(keep, dtype=int)]
+
+
+def global_threshold_from_pooled(
+    pooled: np.ndarray,
+    min_abs: float = 8.0,
+    sigma_k: float = 5.0,
+    clip_hi: float = 0.02,
+    clip_lo: float = 0.0,
+) -> float:
+    x = pooled.astype(float).ravel()
+    if clip_hi > 0 or clip_lo > 0:
+        lo = np.percentile(x, 100 * clip_lo) if clip_lo > 0 else x.min()
+        hi = np.percentile(x, 100 * (1.0 - clip_hi)) if clip_hi > 0 else x.max()
+        sel = (x >= lo) & (x <= hi)
+        x = x[sel] if np.any(sel) else x
+    med = float(np.median(x))
+    madv = float(mad(x))
+    thr_stat = med + sigma_k * madv
+    return float(max(min_abs, thr_stat))
+
+
+def convolve_and_pool(img: np.ndarray, kernel: np.ndarray, pool_size: int = 2):
+    out_valid, (top, _, left, _) = conv2d_valid(img, kernel)
+    pooled, idx_local = max_pool2d_with_indices(out_valid, pool_size, pool_size)
+    return pooled, idx_local, (top, left)
+
+
+def detect_star_candidates_with_threshold(
+    pooled: np.ndarray,
+    idx_local: np.ndarray,
+    offsets: Tuple[int, int],
+    pool_size: int,
+    min_separation_px: int,
+    min_score: float,
+) -> List[Tuple[int, int, float]]:
+    top, left = offsets
+    ys, xs = pooled_indices_to_image_coords(
+        idx_local,
+        pool_size,
+        pool_size,
+        offset_top=top,
+        offset_left=left,
+    )
+    scores = pooled
+    yv, xv, sv = ys.ravel(), xs.ravel(), scores.ravel()
+    mask = sv >= float(min_score)
+    if not np.any(mask):
+        return []
+    yv, xv, sv = yv[mask], xv[mask], sv[mask]
+    keep_idx = nms_min_distance(yv, xv, sv, min_dist=min_separation_px)
+    return [(int(yv[i]), int(xv[i]), float(sv[i])) for i in keep_idx]
+
+
+def detect_stars_pipeline(
+    gray_u8: np.ndarray,
+    *,
+    kernel_size: int = 11,
+    pool_size: int = 2,
+    min_separation_px: int = 30,
+    min_abs: float = 6.0,
+    sigma_k: float = 5.0,
+    clip_hi: float = 0.02,
+    clip_lo: float = 0.0,
+) -> List[Tuple[int, int, float]]:
+    img_corr, _, _ = subtract_background(
+        gray_u8.astype(np.float32),
+        degree=3,
+        subsample=1,
+        iters=2,
+        k_bright=6.0,
+        k_faint=4.0,
+        dilate_bright=3,
+        dilate_faint=1,
+    )
+    ks = int(kernel_size)
+    if ks % 2 == 0:
+        ks += 1
+    ks = max(3, ks)
+    kernel = np.ones((ks, ks), np.float32)
+    kernel /= float(kernel.size)
+    pooled, idx_local, offsets = convolve_and_pool(img_corr, kernel, pool_size)
+    thr = global_threshold_from_pooled(
+        pooled,
+        min_abs=min_abs,
+        sigma_k=sigma_k,
+        clip_hi=clip_hi,
+        clip_lo=clip_lo,
+    )
+    return detect_star_candidates_with_threshold(
+        pooled=pooled,
+        idx_local=idx_local,
+        offsets=offsets,
+        pool_size=pool_size,
+        min_separation_px=min_separation_px,
+        min_score=thr,
+    )
+
+
+# =========================
 # Debayer helpers
 # =========================
 _BAYER_GRAY = {
@@ -318,7 +569,8 @@ def demosaic_raw8(raw: np.ndarray, pattern: str, want_color: bool, hq: bool) -> 
 @dataclass
 class StackConfig:
     roi: int = 1024
-    max_shift_frac: float = 0.35
+    max_shift_frac: float = 0.95
+    allow_expand: bool = True
 
     min_sharpness: float = 2.0
     min_response_lock: float = 0.02
@@ -341,8 +593,10 @@ class LiveStacker:
         self.paused = False
         self.ref_gray_u8: Optional[np.ndarray] = None
         self.ref_hp: Optional[np.ndarray] = None
-        self.acc: Optional[np.ndarray] = None
-        self.wacc: float = 0.0
+        self.acc_sum: Optional[np.ndarray] = None
+        self.acc_w: Optional[np.ndarray] = None
+        self.ref_origin = (0, 0)
+        self.frame_shape: Optional[Tuple[int, int]] = None
 
         self.seen = 0
         self.accepted = 0
@@ -355,8 +609,10 @@ class LiveStacker:
         self.ref_gray_u8 = gray_u8.copy()
         self.ref_hp = dog_highpass(self.ref_gray_u8)
         H, W = gray_u8.shape[:2]
-        self.acc = np.zeros((H, W), dtype=np.float32)
-        self.wacc = 0.0
+        self.acc_sum = np.zeros((H, W), dtype=np.float32)
+        self.acc_w = np.zeros((H, W), dtype=np.float32)
+        self.ref_origin = (0, 0)
+        self.frame_shape = (H, W)
 
     def _compute_weight(self, response: float, sharp: float) -> float:
         if not self.cfg.use_quality_weight:
@@ -364,11 +620,49 @@ class LiveStacker:
         w = (response / max(self.cfg.min_response_lock, 1e-6)) * (sharp / max(self.cfg.min_sharpness, 1e-6))
         return float(np.clip(w, self.cfg.weight_clip[0], self.cfg.weight_clip[1]))
 
+    def _ensure_canvas(self, top: int, left: int, bottom: int, right: int):
+        if self.acc_sum is None or self.acc_w is None:
+            return
+        Hc, Wc = self.acc_sum.shape[:2]
+        pad_top = max(0, -top)
+        pad_left = max(0, -left)
+        pad_bottom = max(0, bottom - Hc)
+        pad_right = max(0, right - Wc)
+        if pad_top or pad_left or pad_bottom or pad_right:
+            self.acc_sum = np.pad(
+                self.acc_sum,
+                ((pad_top, pad_bottom), (pad_left, pad_right)),
+                mode="constant",
+                constant_values=0.0,
+            )
+            self.acc_w = np.pad(
+                self.acc_w,
+                ((pad_top, pad_bottom), (pad_left, pad_right)),
+                mode="constant",
+                constant_values=0.0,
+            )
+            oy, ox = self.ref_origin
+            self.ref_origin = (oy + pad_top, ox + pad_left)
+
+    def _stack_region_for_ref(self, st: np.ndarray) -> Optional[np.ndarray]:
+        if self.frame_shape is None:
+            return None
+        H, W = self.frame_shape
+        oy, ox = self.ref_origin
+        if oy < 0 or ox < 0:
+            return None
+        if oy + H > st.shape[0] or ox + W > st.shape[1]:
+            return None
+        return st[oy:oy + H, ox:ox + W]
+
     def _update_ref_from_stack(self):
         st = self.get_stack_u8(raw=True)
         if st is None:
             return
-        self.ref_gray_u8 = st
+        ref = self._stack_region_for_ref(st)
+        if ref is None:
+            return
+        self.ref_gray_u8 = ref
         self.ref_hp = dog_highpass(self.ref_gray_u8)
 
     def process(self, gray_u8: np.ndarray):
@@ -398,40 +692,113 @@ class LiveStacker:
             return
 
         if self.state == "LOCKED":
-            if too_far or resp < self.cfg.min_response_lock or sp < self.cfg.min_star_proxy:
+            if (not self.cfg.allow_expand and too_far) or resp < self.cfg.min_response_lock or sp < self.cfg.min_star_proxy:
                 self.state = "LOST"
                 return
             if sharp < self.cfg.min_sharpness:
                 return
 
-            aligned = warp_shift(gray_u8.astype(np.float32), dx, dy)
             w = self._compute_weight(resp, sharp)
-            self.acc += aligned * w
-            self.wacc += w
+            if self.acc_sum is None or self.acc_w is None:
+                self._init_ref(gray_u8)
+                return
+
+            oy, ox = self.ref_origin
+            top = int(np.floor(oy + dy))
+            left = int(np.floor(ox + dx))
+            bottom = int(np.ceil(oy + dy + H))
+            right = int(np.ceil(ox + dx + W))
+            if self.cfg.allow_expand:
+                self._ensure_canvas(top, left, bottom, right)
+                oy, ox = self.ref_origin
+
+            Hc, Wc = self.acc_sum.shape[:2]
+            M = np.array([[1, 0, ox + dx], [0, 1, oy + dy]], dtype=np.float32)
+            aligned = cv2.warpAffine(
+                gray_u8.astype(np.float32),
+                M,
+                (Wc, Hc),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            mask = cv2.warpAffine(
+                np.ones((H, W), dtype=np.float32),
+                M,
+                (Wc, Hc),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            self.acc_sum += aligned * w
+            self.acc_w += mask * w
             self.accepted += 1
 
             if self.accepted % max(5, self.cfg.update_ref_every_accepted) == 0:
                 self._update_ref_from_stack()
         else:
-            if (not too_far) and (resp >= self.cfg.min_response_reacq) and (sp >= self.cfg.min_star_proxy):
+            if (self.cfg.allow_expand or not too_far) and (resp >= self.cfg.min_response_reacq) and (sp >= self.cfg.min_star_proxy):
                 self._init_ref(gray_u8)
                 self.state = "LOCKED"
 
     def get_stack_u8(self, raw: bool = False) -> Optional[np.ndarray]:
-        if self.acc is None or self.wacc <= 0:
+        if self.acc_sum is None or self.acc_w is None or not np.any(self.acc_w > 0):
             return None
-        img = (self.acc / self.wacc)
+        denom = np.maximum(self.acc_w, 1e-6)
+        img = self.acc_sum / denom
+        img = np.where(self.acc_w > 0, img, 0.0)
         return np.clip(img, 0, 255).astype(np.uint8)
 
     def overlay_lines(self) -> List[str]:
         resp, sharp = self.last_scores
         dx, dy = self.last_dxdy
+        canvas = ""
+        if self.acc_sum is not None:
+            Hc, Wc = self.acc_sum.shape[:2]
+            canvas = f"   Canvas={Wc}x{Hc}"
         return [
-            f"STATE: {self.state}   {'PAUSED' if self.paused else 'RUNNING'}",
+            f"STATE: {self.state}   {'PAUSED' if self.paused else 'RUNNING'}{canvas}",
             f"Frames: seen={self.seen}   accepted={self.accepted}",
             f"Score: resp={resp:.3f}   sharp={sharp:.2f}   stars~{self.last_star_proxy}",
             f"Shift: dx={dx:.2f}   dy={dy:.2f}",
         ]
+
+
+# =========================
+# Plate solving helpers
+# =========================
+@dataclass
+class SolveConfig:
+    capture_n: int = 5
+    target: str = "0 0"
+    pixel_um: float = 2.9
+    focal_mm: float = 900.0
+    gmax: float = 15.0
+    nside: int = 32
+    tol_rel: float = 0.05
+    arcsec_err_cap: float = 0.05
+    max_per_pair: int = 200
+    max_gaia_sources: int = 8000
+    plot: bool = False
+    verbose: bool = False
+
+    kernel_size: int = 11
+    pool_size: int = 2
+    min_sep_px: int = 30
+    min_abs: float = 6.0
+    sigma_k: float = 5.0
+    clip_hi: float = 0.02
+    clip_lo: float = 0.0
+
+
+def estimate_radius_deg(width: int, height: int, pixel_um: float, focal_mm: float, margin: float = 1.25) -> float:
+    pixel_size_m = float(pixel_um) * 1e-6
+    focal_m = float(focal_mm) * 1e-3
+    scale = (206265.0 * pixel_size_m) / focal_m
+    diag_px = float(np.hypot(width, height))
+    diag_deg = (diag_px * scale) / 3600.0
+    radius_deg = 0.5 * diag_deg * float(margin)
+    return float(max(radius_deg, 0.10))
 
 
 # =========================
@@ -1072,9 +1439,12 @@ class Params:
 # =========================
 # Main
 # =========================
-def main(outdir: str = "captures", roi: int = 1024, binning: int = 1):
+def main(outdir: str = "captures", roi: int = 0, binning: int = 1, solve_cfg: Optional[SolveConfig] = None):
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
+
+    if solve_cfg is None:
+        solve_cfg = SolveConfig()
 
     cfg = StackConfig(roi=roi)
     stacker = LiveStacker(cfg)
@@ -1082,19 +1452,22 @@ def main(outdir: str = "captures", roi: int = 1024, binning: int = 1):
 
     running = {"quit": False}
     saved = {"stack": 0, "live": 0}
-    last_live_holder = {"bgr": np.zeros((roi, roi, 3), dtype=np.uint8)}
+    preview_size = roi if roi > 0 else 512
+    last_live_holder = {"bgr": np.zeros((preview_size, preview_size, 3), dtype=np.uint8)}
     camera = {
         "connected": False,
         "cam_id": None,
         "props": None,
         "model": "Sin camara",
         "is_color": False,
-        "iw": roi,
-        "ih": roi,
+        "iw": preview_size,
+        "ih": preview_size,
         "fmt": None,
         "buf": None,
     }
     started = False
+    solve_request = {"pending": False}
+    last_solve_metrics = {"metrics": None}
 
     # Window size (safe default)
     pad = 12
@@ -1134,6 +1507,7 @@ def main(outdir: str = "captures", roi: int = 1024, binning: int = 1):
     ui.add_button(Button("pause", "Pause", (0, 0, 1, 1), act_pause, tooltip="Pausa/continua el acumulado.", toggled=lambda: stacker.paused))
     ui.add_button(Button("savestack", "SaveStack", (0, 0, 1, 1), act_save_stack, tooltip="Guarda el stack actual (PNG 8-bit)."))
     ui.add_button(Button("savelive", "SaveLive", (0, 0, 1, 1), act_save_live, tooltip="Guarda la vista LIVE actual (PNG)."))
+    ui.add_button(Button("solve", "Solve", (0, 0, 1, 1), lambda: solve_request.update(pending=True), tooltip="Captura y plate solve (Gaia)."))
     ui.add_button(Button("quit", "Quit", (0, 0, 1, 1), act_quit, tooltip="Salir."))
 
     # Controls
@@ -1248,6 +1622,13 @@ def main(outdir: str = "captures", roi: int = 1024, binning: int = 1):
         getter=lambda: p.gamma, setter=lambda v: setattr(p, "gamma", float(v)),
         vmin=0.5, vmax=3.0, step=0.05, step_fast=0.20, fmt="{:.2f}"
     ))
+    ui.add_control(SpinnerControl(
+        key="capturen", label="Capture N",
+        tooltip="Cantidad de frames para promediar antes del plate solve.",
+        rect=(0, 0, 1, 1),
+        getter=lambda: solve_cfg.capture_n, setter=lambda v: setattr(solve_cfg, "capture_n", int(v)),
+        vmin=1, vmax=30, step=1, step_fast=5, fmt="{:.0f}"
+    ))
 
     # Debounce apply
     last_apply_t = 0.0
@@ -1305,11 +1686,11 @@ def main(outdir: str = "captures", roi: int = 1024, binning: int = 1):
             "is_color": False,
             "fmt": None,
             "buf": None,
-            "iw": roi,
-            "ih": roi,
+            "iw": preview_size,
+            "ih": preview_size,
         })
         last_applied.update({"exp_ms": None, "gain": None, "gain_auto": None})
-        last_live_holder["bgr"] = np.zeros((roi, roi, 3), dtype=np.uint8)
+        last_live_holder["bgr"] = np.zeros((preview_size, preview_size, 3), dtype=np.uint8)
         stacker.reset()
         if reason:
             print(reason)
@@ -1326,7 +1707,10 @@ def main(outdir: str = "captures", roi: int = 1024, binning: int = 1):
             opened = True
             ensure_ok(pyPOACamera.InitCamera(cam_id), "InitCamera")
             ensure_ok(pyPOACamera.SetImageBin(cam_id, int(binning)), "SetImageBin")
-            roi_w, roi_h, sx, sy = set_centered_roi(cam_id, props, roi, roi)
+            if roi > 0:
+                roi_w, roi_h, sx, sy = set_centered_roi(cam_id, props, roi, roi)
+            else:
+                roi_w, roi_h, sx, sy = set_centered_roi(cam_id, props, props.maxWidth, props.maxHeight)
 
             # Always RAW8 (for debayer + consistent pipeline)
             fmt = pyPOACamera.POAImgFormat.POA_RAW8
@@ -1384,7 +1768,7 @@ def main(outdir: str = "captures", roi: int = 1024, binning: int = 1):
 
         print("Modo rapido spinners: mantener presionado ▲/▼. Shift acelera (step_fast).")
         print("Editar valores: click en el numero, escribe, Enter aplica, Esc cancela.")
-        print("Teclas: q=quit, r=reset, p=pause, s=save stack, l=save live")
+        print("Teclas: q=quit, r=reset, p=pause, s=save stack, l=save live, c=solve")
 
         while not running["quit"]:
             ui.tick_repeat()
@@ -1437,6 +1821,79 @@ def main(outdir: str = "captures", roi: int = 1024, binning: int = 1):
                         except Exception as e:
                             print("Warning: stacker.process failed:", repr(e))
                             stacker.state = "LOST"
+
+                        if solve_request["pending"]:
+                            solve_request["pending"] = False
+                            try:
+                                frames = []
+                                for _ in range(int(max(1, solve_cfg.capture_n))):
+                                    while True:
+                                        err, ready = pyPOACamera.ImageReady(cam_id)
+                                        ensure_ok(err, "ImageReady")
+                                        if ready:
+                                            break
+                                        time.sleep(0.001)
+                                    timeout_ms = int(p.exp_ms) + 2500
+                                    ensure_ok(pyPOACamera.GetImageData(cam_id, buf, timeout_ms), "GetImageData")
+                                    im = pyPOACamera.ImageDataConvert(buf, ih, iw, fmt)
+                                    if is_color:
+                                        pattern = bayer_opts[int(p.bayer_idx) % len(bayer_opts)]
+                                        gcap, _ = demosaic_raw8(
+                                            raw=im,
+                                            pattern=pattern,
+                                            want_color=False,
+                                            hq=bool(p.debayer_hq),
+                                        )
+                                    else:
+                                        gcap = ensure_gray_u8(im)
+                                    frames.append(gcap.astype(np.float32))
+
+                                gmean = np.mean(frames, axis=0)
+                                gray_cap = np.clip(gmean, 0, 255).astype(np.uint8)
+                                stars = detect_stars_pipeline(
+                                    gray_cap,
+                                    kernel_size=solve_cfg.kernel_size,
+                                    pool_size=solve_cfg.pool_size,
+                                    min_separation_px=solve_cfg.min_sep_px,
+                                    min_abs=solve_cfg.min_abs,
+                                    sigma_k=solve_cfg.sigma_k,
+                                    clip_hi=solve_cfg.clip_hi,
+                                    clip_lo=solve_cfg.clip_lo,
+                                )
+                                print(f"[SOLVE] stars={len(stars)} -> {stars[:5]}{' ...' if len(stars) > 5 else ''}")
+
+                                if len(stars) < 4:
+                                    last_solve_metrics["metrics"] = None
+                                    print("[SOLVE] Not enough stars (need ~4+).")
+                                else:
+                                    radius_deg = estimate_radius_deg(iw, ih, solve_cfg.pixel_um, solve_cfg.focal_mm, margin=1.25)
+                                    pixel_size_m = float(solve_cfg.pixel_um) * 1e-6
+                                    focal_m = float(solve_cfg.focal_mm) * 1e-3
+                                    print(f"[SOLVE] running pipeline: radius_deg={radius_deg:.3f} gmax={solve_cfg.gmax}")
+                                    out = run_pipeline(
+                                        stars=stars,
+                                        target=solve_cfg.target,
+                                        radius_deg=radius_deg,
+                                        gmax=solve_cfg.gmax,
+                                        pixel_size_m=pixel_size_m,
+                                        focal_m=focal_m,
+                                        tol_rel=solve_cfg.tol_rel,
+                                        max_per_pair=solve_cfg.max_per_pair,
+                                        arcsec_err_cap=solve_cfg.arcsec_err_cap,
+                                        nside=solve_cfg.nside,
+                                        auth=None,
+                                        row_limit=-1,
+                                        plot=solve_cfg.plot,
+                                        verbose=solve_cfg.verbose,
+                                        label_brightest=20 if solve_cfg.plot else 0,
+                                        simbad_radius_arcsec=1.0,
+                                        max_gaia_sources=solve_cfg.max_gaia_sources,
+                                    )
+                                    last_solve_metrics["metrics"] = out.get("metrics", None)
+                                    print(f"[SOLVE] metrics={last_solve_metrics['metrics']}")
+                            except Exception as e:
+                                last_solve_metrics["metrics"] = None
+                                print("Warning: solve failed:", repr(e))
                 except Exception as e:
                     print("Warning: camera connection lost:", repr(e))
                     disconnect_camera("Camara desconectada. Usa el boton Conectar para reconectar.")
@@ -1483,8 +1940,11 @@ def main(outdir: str = "captures", roi: int = 1024, binning: int = 1):
             info = stacker.overlay_lines()
             info.append(f"Gates: sharp>={cfg.min_sharpness:.1f}  lock>={cfg.min_response_lock:.3f}  reacq>={cfg.min_response_reacq:.3f}")
             info.append(f"MaxShift={cfg.max_shift_frac:.2f}  RefUpd={cfg.update_ref_every_accepted}  StarsMin={cfg.min_star_proxy}  Weight={cfg.use_quality_weight}")
+            if last_solve_metrics["metrics"] is not None:
+                met = last_solve_metrics["metrics"]
+                info.append(f"Solve: err_med={met.get('err_median', -1):.3f}\"  err_max={met.get('err_max', -1):.3f}\"  n_img={met.get('n_img', 0)}")
 
-            ui.render(live_disp, st_disp, info[:5], status_right, footer_right, stacker.state)
+            ui.render(live_disp, st_disp, info, status_right, footer_right, stacker.state)
 
             btn = ui._get_button("connect")
             if btn is not None:
@@ -1504,6 +1964,8 @@ def main(outdir: str = "captures", roi: int = 1024, binning: int = 1):
                 act_save_stack()
             elif key == ord("l"):
                 act_save_live()
+            elif key == ord("c"):
+                solve_request["pending"] = True
 
         if camera["connected"] and camera["cam_id"] is not None:
             err, dropped = pyPOACamera.GetDroppedImagesCount(camera["cam_id"])
@@ -1518,4 +1980,28 @@ def main(outdir: str = "captures", roi: int = 1024, binning: int = 1):
 
 
 if __name__ == "__main__":
-    main(outdir="captures", roi=1024, binning=1)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--outdir", type=str, default="captures")
+    parser.add_argument("--roi", type=int, default=0, help="ROI cuadrado; 0 = full frame.")
+    parser.add_argument("--binning", type=int, default=1)
+    parser.add_argument("--target", type=str, default="0 0")
+    parser.add_argument("--pixel_um", type=float, default=2.9)
+    parser.add_argument("--focal_mm", type=float, default=900.0)
+    parser.add_argument("--gmax", type=float, default=15.0)
+    parser.add_argument("--nside", type=int, default=32)
+    parser.add_argument("--plot", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--capture_n", type=int, default=5)
+    args = parser.parse_args()
+
+    solve_cfg = SolveConfig(
+        capture_n=args.capture_n,
+        target=args.target,
+        pixel_um=args.pixel_um,
+        focal_mm=args.focal_mm,
+        gmax=args.gmax,
+        nside=args.nside,
+        plot=bool(args.plot),
+        verbose=bool(args.verbose),
+    )
+    main(outdir=args.outdir, roi=args.roi, binning=args.binning, solve_cfg=solve_cfg)

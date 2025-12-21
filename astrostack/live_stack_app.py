@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import sys
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -33,7 +34,12 @@ from typing import Optional, Tuple, Callable, List, Dict, Union
 
 import numpy as np
 import cv2
-import pyPOACamera
+
+PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+if str(PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_ROOT))
+
+from astrostack import pyPOACamera
 
 cv2.setUseOptimized(True)
 

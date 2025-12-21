@@ -1,10 +1,19 @@
 # -*- coding: utf-8 -*-
 from ctypes import *
+from pathlib import Path
 import numpy as np
 from enum import Enum
 #dll = cdll.LoadLibrary("./PlayerOneCamera.dll") # Windows, if your python is 64bit, please copy dll file from lib\x64 folder, if python is 32bit, copy dll file from lib\x86
 #dll = cdll.LoadLibrary("./libPlayerOneCamera.so") # Linux, please copy the 4 'so' files of the corresponding architecture, eg: if your Linux is arm64(aarch64) architecture, please copy the 4 'so' files from lib\arm64
-dll = cdll.LoadLibrary("./libPlayerOneCamera.dylib") # Mac OS, please copy the 4 'dylib' files from 'lib' folder
+_LIB_ROOT = Path(__file__).resolve().parent.parent
+_MAC_LIB_CANDIDATES = ("libPlayerOneCamera.dylib", "libPlayerOneCamera.3.9.0.dylib")
+for _lib_name in _MAC_LIB_CANDIDATES:
+    _candidate = _LIB_ROOT / _lib_name
+    if _candidate.exists():
+        dll = cdll.LoadLibrary(str(_candidate))
+        break
+else:
+    dll = cdll.LoadLibrary(_MAC_LIB_CANDIDATES[0])  # Mac OS, copy dylib files into repo root or CWD
 
 
 #************************Type Define************************

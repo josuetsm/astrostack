@@ -568,7 +568,7 @@ def demosaic_raw8(raw: np.ndarray, pattern: str, want_color: bool, hq: bool) -> 
 # =========================
 @dataclass
 class StackConfig:
-    roi: int = 1024
+    roi: int = 0
     max_shift_frac: float = 0.95
     allow_expand: bool = True
 
@@ -692,7 +692,8 @@ class LiveStacker:
             return
 
         if self.state == "LOCKED":
-            if (not self.cfg.allow_expand and too_far) or resp < self.cfg.min_response_lock or sp < self.cfg.min_star_proxy:
+            star_gate = (self.cfg.min_star_proxy > 0) and (sp < self.cfg.min_star_proxy)
+            if (not self.cfg.allow_expand and too_far) or resp < self.cfg.min_response_lock or star_gate:
                 self.state = "LOST"
                 return
             if sharp < self.cfg.min_sharpness:
@@ -737,7 +738,8 @@ class LiveStacker:
             if self.accepted % max(5, self.cfg.update_ref_every_accepted) == 0:
                 self._update_ref_from_stack()
         else:
-            if (self.cfg.allow_expand or not too_far) and (resp >= self.cfg.min_response_reacq) and (sp >= self.cfg.min_star_proxy):
+            star_gate = (self.cfg.min_star_proxy > 0) and (sp < self.cfg.min_star_proxy)
+            if (self.cfg.allow_expand or not too_far) and (resp >= self.cfg.min_response_reacq) and (not star_gate):
                 self._init_ref(gray_u8)
                 self.state = "LOCKED"
 
@@ -1423,11 +1425,11 @@ class Params:
     gamma: float = 1.40
 
     min_sharpness: float = 2.0
-    resp_lock: float = 0.020
-    resp_reacq: float = 0.030
+    resp_lock: float = 0.010
+    resp_reacq: float = 0.015
     max_shift_pct: int = 35
     ref_update_every: int = 50
-    min_stars_proxy: int = 2
+    min_stars_proxy: int = 0
     weight: bool = True
 
     # Debayer
@@ -1592,7 +1594,7 @@ def main(outdir: str = "captures", roi: int = 0, binning: int = 1, solve_cfg: Op
     ))
     ui.add_control(SpinnerControl(
         key="minstars", label="Min Stars",
-        tooltip="Proxy minimo de estrellas para LOCKED/reacquire. | Baja si el campo tiene pocas estrellas.",
+        tooltip="Proxy minimo de estrellas para LOCKED/reacquire. | 0 = desactiva gate. | Baja si el campo tiene pocas estrellas.",
         rect=(0, 0, 1, 1),
         getter=lambda: p.min_stars_proxy, setter=lambda v: setattr(p, "min_stars_proxy", int(v)),
         vmin=0, vmax=30, step=1, step_fast=5, fmt="{:.0f}"

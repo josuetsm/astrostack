@@ -13,16 +13,22 @@ pip install numpy opencv-python astropy astroquery scipy astropy-healpix pandas 
 
 from __future__ import annotations
 
+import sys
 import time
 import argparse
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Tuple, Optional
 
 import numpy as np
 import cv2
-import pyPOACamera
 
-from .plate_solve_pipeline import run_pipeline
+PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+if str(PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_ROOT))
+
+from astrostack import pyPOACamera
+from astrostack.plate_solve_pipeline import run_pipeline
 
 
 # ----------------------------- POA helpers -----------------------------

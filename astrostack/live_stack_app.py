@@ -1290,8 +1290,18 @@ class SingleWindowUI:
         if stack_disp_u8 is None:
             stack_view = np.zeros((view_h, view_w, 3), dtype=np.uint8)
         else:
-            st = cv2.resize(stack_disp_u8, (view_w, view_h), interpolation=cv2.INTER_AREA)
-            stack_view = cv2.cvtColor(st, cv2.COLOR_GRAY2BGR) if st.ndim == 2 else st
+            st = cv2.cvtColor(stack_disp_u8, cv2.COLOR_GRAY2BGR) if stack_disp_u8.ndim == 2 else stack_disp_u8
+            sh, sw = st.shape[:2]
+            crop_w = min(sw, view_w)
+            crop_h = min(sh, view_h)
+            src_x0 = max(0, (sw - crop_w) // 2)
+            src_y0 = max(0, (sh - crop_h) // 2)
+            src_x1 = src_x0 + crop_w
+            src_y1 = src_y0 + crop_h
+            dst_x0 = max(0, (view_w - crop_w) // 2)
+            dst_y0 = max(0, (view_h - crop_h) // 2)
+            stack_view = np.zeros((view_h, view_w, 3), dtype=np.uint8)
+            stack_view[dst_y0:dst_y0 + crop_h, dst_x0:dst_x0 + crop_w] = st[src_y0:src_y1, src_x0:src_x1]
 
         canvas[ly:ly + view_h, lx:lx + view_w] = live_view
         canvas[ry:ry + view_h, rx:rx + view_w] = stack_view
@@ -1416,12 +1426,12 @@ class SingleWindowUI:
 # =========================
 @dataclass
 class Params:
-    exp_ms: int = 200
+    exp_ms: int = 20
     gain: int = 200
     gain_auto: bool = False
 
     live_stretch: bool = True
-    auto_contrast: bool = True
+    auto_contrast: bool = False
     gamma: float = 1.40
 
     min_sharpness: float = 2.0

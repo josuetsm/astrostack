@@ -1481,6 +1481,9 @@ class SingleWindowUI:
                     c.inc(-c.step)
                     return
             c.on_key(key)
+            return
+        if isinstance(c, TextControl):
+            c.on_key(key)
 
 
 # =========================
@@ -1814,6 +1817,10 @@ def main(outdir: str = "captures", roi: int = 0, binning: int = 1, solve_cfg: Op
 
             err, iw, ih = pyPOACamera.GetImageSize(cam_id)
             ensure_ok(err, "GetImageSize")
+            if roi == 0 and (iw != props.maxWidth or ih != props.maxHeight):
+                roi_w, roi_h, sx, sy = set_centered_roi(cam_id, props, props.maxWidth, props.maxHeight)
+                err, iw, ih = pyPOACamera.GetImageSize(cam_id)
+                ensure_ok(err, "GetImageSize(full)")
             err, fmt2 = pyPOACamera.GetImageFormat(cam_id)
             ensure_ok(err, "GetImageFormat")
             fmt = fmt2

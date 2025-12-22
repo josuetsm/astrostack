@@ -773,6 +773,7 @@ class LiveStacker:
 class SolveConfig:
     capture_n: int = 5
     target: str = "0 0"
+    radius_deg: float = 0.0
     pixel_um: float = 2.9
     focal_mm: float = 900.0
     gmax: float = 15.0
@@ -1065,6 +1066,65 @@ class EnumControl(UIControl):
         self.inc(+1)
 
 
+@dataclass
+class TextControl(UIControl):
+    key: str
+    label: str
+    tooltip: str
+    rect: Tuple[int, int, int, int]
+    getter: Callable[[], str]
+    setter: Callable[[str], None]
+    max_len: int = 64
+
+    _editing: bool = False
+    _edit_text: str = ""
+
+    def draw(self, canvas, fonts, hovered, focused):
+        x, y, w, h = self.rect
+        base = (70, 70, 70)
+        border = (195, 195, 195) if focused else ((170, 170, 170) if hovered else (120, 120, 120))
+        cv2.rectangle(canvas, (x, y), (x + w, y + h), base, -1)
+        cv2.rectangle(canvas, (x, y), (x + w, y + h), border, 1)
+
+        TR.put(canvas, self.label, (x + 8, y + int(h * 0.42)),
+               FONT_FACE, fonts.small, (220, 220, 220), THICK_INFO, height_px=int(14 * fonts.small))
+
+        val = self._edit_text if self._editing else self.getter()
+        TR.put(canvas, val, (x + 8, y + int(h * 0.85)),
+               FONT_FACE, fonts.ui, (245, 245, 245), THICK_UI, height_px=int(18 * fonts.ui))
+
+    def on_click(self, x: int, y: int, flags: int):
+        self._editing = True
+        self._edit_text = str(self.getter())
+
+    def cancel_edit(self):
+        self._editing = False
+        self._edit_text = ""
+
+    def commit_edit(self):
+        if not self._editing:
+            return
+        text = self._edit_text.strip()
+        self.setter(text)
+        self.cancel_edit()
+
+    def on_key(self, key: int):
+        if not self._editing:
+            return
+        if key in (13, 10):
+            self.commit_edit()
+            return
+        if key == 27:
+            self.cancel_edit()
+            return
+        if key in (8, 127):
+            self._edit_text = self._edit_text[:-1]
+            return
+        ch = chr(key) if 32 <= key <= 126 else ""
+        if ch and len(self._edit_text) < self.max_len:
+            self._edit_text += ch
+
+
 # =========================
 # UI manager
 # =========================
@@ -1124,6 +1184,8 @@ class SingleWindowUI:
         if self.focus_key is not None and self.focus_key != key:
             prev = self._get_control(self.focus_key)
             if isinstance(prev, SpinnerControl):
+                prev.commit_edit()
+            if isinstance(prev, TextControl):
                 prev.commit_edit()
         self.focus_key = key
 
@@ -1290,8 +1352,18 @@ class SingleWindowUI:
         if stack_disp_u8 is None:
             stack_view = np.zeros((view_h, view_w, 3), dtype=np.uint8)
         else:
-            st = cv2.resize(stack_disp_u8, (view_w, view_h), interpolation=cv2.INTER_AREA)
-            stack_view = cv2.cvtColor(st, cv2.COLOR_GRAY2BGR) if st.ndim == 2 else st
+            st = cv2.cvtColor(stack_disp_u8, cv2.COLOR_GRAY2BGR) if stack_disp_u8.ndim == 2 else stack_disp_u8
+            sh, sw = st.shape[:2]
+            crop_w = min(sw, view_w)
+            crop_h = min(sh, view_h)
+            src_x0 = max(0, (sw - crop_w) // 2)
+            src_y0 = max(0, (sh - crop_h) // 2)
+            src_x1 = src_x0 + crop_w
+            src_y1 = src_y0 + crop_h
+            dst_x0 = max(0, (view_w - crop_w) // 2)
+            dst_y0 = max(0, (view_h - crop_h) // 2)
+            stack_view = np.zeros((view_h, view_w, 3), dtype=np.uint8)
+            stack_view[dst_y0:dst_y0 + crop_h, dst_x0:dst_x0 + crop_w] = st[src_y0:src_y1, src_x0:src_x1]
 
         canvas[ly:ly + view_h, lx:lx + view_w] = live_view
         canvas[ry:ry + view_h, rx:rx + view_w] = stack_view
@@ -1416,12 +1488,12 @@ class SingleWindowUI:
 # =========================
 @dataclass
 class Params:
-    exp_ms: int = 200
+    exp_ms: int = 20
     gain: int = 200
     gain_auto: bool = False
 
     live_stretch: bool = True
-    auto_contrast: bool = True
+    auto_contrast: bool = False
     gamma: float = 1.40
 
     min_sharpness: float = 2.0
@@ -1630,6 +1702,28 @@ def main(outdir: str = "captures", roi: int = 0, binning: int = 1, solve_cfg: Op
         rect=(0, 0, 1, 1),
         getter=lambda: solve_cfg.capture_n, setter=lambda v: setattr(solve_cfg, "capture_n", int(v)),
         vmin=1, vmax=30, step=1, step_fast=5, fmt="{:.0f}"
+    ))
+    ui.add_control(TextControl(
+        key="solvetarget", label="Solve Target",
+        tooltip="Target para el plate solve (texto libre). | Ej: \"M31\" o \"00 42 44 +41 16 9\".",
+        rect=(0, 0, 1, 1),
+        getter=lambda: solve_cfg.target,
+        setter=lambda v: setattr(solve_cfg, "target", str(v)),
+        max_len=64,
+    ))
+    ui.add_control(SpinnerControl(
+        key="solverad", label="Solve Radius (deg)",
+        tooltip="Radio de busqueda en grados. | 0 = auto segun pixel/focal.",
+        rect=(0, 0, 1, 1),
+        getter=lambda: solve_cfg.radius_deg, setter=lambda v: setattr(solve_cfg, "radius_deg", float(v)),
+        vmin=0.0, vmax=20.0, step=0.1, step_fast=0.5, fmt="{:.1f}"
+    ))
+    ui.add_control(SpinnerControl(
+        key="solvegmax", label="Solve GMax",
+        tooltip="Magnitud maxima (Gaia) usada para el solve.",
+        rect=(0, 0, 1, 1),
+        getter=lambda: solve_cfg.gmax, setter=lambda v: setattr(solve_cfg, "gmax", float(v)),
+        vmin=5.0, vmax=20.0, step=0.1, step_fast=0.5, fmt="{:.1f}"
     ))
 
     # Debounce apply
@@ -1868,13 +1962,17 @@ def main(outdir: str = "captures", roi: int = 0, binning: int = 1, solve_cfg: Op
                                     last_solve_metrics["metrics"] = None
                                     print("[SOLVE] Not enough stars (need ~4+).")
                                 else:
-                                    radius_deg = estimate_radius_deg(iw, ih, solve_cfg.pixel_um, solve_cfg.focal_mm, margin=1.25)
+                                    if float(solve_cfg.radius_deg) > 0:
+                                        radius_deg = float(solve_cfg.radius_deg)
+                                    else:
+                                        radius_deg = estimate_radius_deg(iw, ih, solve_cfg.pixel_um, solve_cfg.focal_mm, margin=1.25)
                                     pixel_size_m = float(solve_cfg.pixel_um) * 1e-6
                                     focal_m = float(solve_cfg.focal_mm) * 1e-3
-                                    print(f"[SOLVE] running pipeline: radius_deg={radius_deg:.3f} gmax={solve_cfg.gmax}")
+                                    target = solve_cfg.target.strip() or "0 0"
+                                    print(f"[SOLVE] running pipeline: radius_deg={radius_deg:.3f} gmax={solve_cfg.gmax} target={target}")
                                     out = run_pipeline(
                                         stars=stars,
-                                        target=solve_cfg.target,
+                                        target=target,
                                         radius_deg=radius_deg,
                                         gmax=solve_cfg.gmax,
                                         pixel_size_m=pixel_size_m,

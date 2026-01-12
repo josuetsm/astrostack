@@ -74,6 +74,7 @@ class AstroStackApp(QtWidgets.QMainWindow):
         self.worker: Optional[threading.Thread] = None
         self.solve_worker: Optional[threading.Thread] = None
         self.goto_worker: Optional[threading.Thread] = None
+        self.manual_move_worker: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
 
         self._build_ui()
@@ -250,6 +251,10 @@ class AstroStackApp(QtWidgets.QMainWindow):
         apply_button = QtWidgets.QPushButton("Apply tracking settings")
         apply_button.clicked.connect(self.apply_tracking)
         layout.addWidget(apply_button, alignment=QtCore.Qt.AlignLeft)
+
+        reset_button = QtWidgets.QPushButton("Reset keyframe")
+        reset_button.clicked.connect(self.reset_tracking_keyframe)
+        layout.addWidget(reset_button, alignment=QtCore.Qt.AlignLeft)
 
         status_box = QtWidgets.QGroupBox("Tracking telemetry")
         status_layout = QtWidgets.QVBoxLayout(status_box)
@@ -461,6 +466,36 @@ class AstroStackApp(QtWidgets.QMainWindow):
         objects_layout.addWidget(self.goto_objects_button, 2, 0, 1, 4)
         layout.addWidget(objects_box)
 
+        manual_box = QtWidgets.QGroupBox("Manual mount movement")
+        manual_layout = QtWidgets.QGridLayout(manual_box)
+        self.manual_steps_az_input = QtWidgets.QLineEdit("200")
+        self.manual_delay_az_input = QtWidgets.QLineEdit("1500")
+        self.manual_steps_alt_input = QtWidgets.QLineEdit("200")
+        self.manual_delay_alt_input = QtWidgets.QLineEdit("1500")
+        self.manual_az_left_button = QtWidgets.QPushButton("AZ ◀")
+        self.manual_az_right_button = QtWidgets.QPushButton("AZ ▶")
+        self.manual_alt_up_button = QtWidgets.QPushButton("ALT ▲")
+        self.manual_alt_down_button = QtWidgets.QPushButton("ALT ▼")
+        self.manual_az_left_button.clicked.connect(lambda: self._start_manual_move("A", "REV"))
+        self.manual_az_right_button.clicked.connect(lambda: self._start_manual_move("A", "FWD"))
+        self.manual_alt_up_button.clicked.connect(lambda: self._start_manual_move("B", "FWD"))
+        self.manual_alt_down_button.clicked.connect(lambda: self._start_manual_move("B", "REV"))
+
+        manual_layout.addWidget(QtWidgets.QLabel("AZ steps"), 0, 0)
+        manual_layout.addWidget(self.manual_steps_az_input, 0, 1)
+        manual_layout.addWidget(QtWidgets.QLabel("AZ delay (us)"), 0, 2)
+        manual_layout.addWidget(self.manual_delay_az_input, 0, 3)
+        manual_layout.addWidget(self.manual_az_left_button, 1, 0)
+        manual_layout.addWidget(self.manual_az_right_button, 1, 1)
+
+        manual_layout.addWidget(QtWidgets.QLabel("ALT steps"), 2, 0)
+        manual_layout.addWidget(self.manual_steps_alt_input, 2, 1)
+        manual_layout.addWidget(QtWidgets.QLabel("ALT delay (us)"), 2, 2)
+        manual_layout.addWidget(self.manual_delay_alt_input, 2, 3)
+        manual_layout.addWidget(self.manual_alt_up_button, 3, 0)
+        manual_layout.addWidget(self.manual_alt_down_button, 3, 1)
+        layout.addWidget(manual_box)
+
         status_box = QtWidgets.QGroupBox("GoTo result")
         status_layout = QtWidgets.QVBoxLayout(status_box)
         self.goto_detail_label = QtWidgets.QLabel("Need a plate solution to compute offsets.")
@@ -600,6 +635,11 @@ class AstroStackApp(QtWidgets.QMainWindow):
         )
         self.tracker.config = cfg
         self.log("Tracking settings updated.")
+
+    def reset_tracking_keyframe(self) -> None:
+        self.tracker.reset()
+        self.log("Tracking keyframe reset.")
+        self.track_detail_label.setText("Tracking reset; awaiting new frames.")
 
     def toggle_arduino_connection(self) -> None:
         if self.arduino.is_connected:

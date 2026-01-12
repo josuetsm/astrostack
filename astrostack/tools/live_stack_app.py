@@ -1,27 +1,16 @@
-# app.py
-# Live Stacking (shift-and-add) para Player One Mars-C con pyPOACamera
-# UI: una sola ventana OpenCV, con:
-#   - Botones clickeables
-#   - Spinners tipo FireCapture (valor + flechas ▲▼), sin sliders
-#   - Tooltips al hover (dwell)
-#   - Entrada directa: click en valor -> escribe -> Enter aplica, Esc cancela
-#   - Modo rápido: mantener presionado ▲/▼ repite + aceleración
-#       * Shift + mantener presionado => step_fast inmediato
-#
-# Debayer:
-#   - Toggle Debayer (color) + patrón Bayer + Debayer HQ (VNG)
-#   - Siempre capturamos RAW8 para consistencia y rapidez.
-#
-# Unicode/tildes:
-#   - Con opencv-contrib-python: usa cv2.freetype + TTF => Unicode OK
-#   - Sin contrib: fallback ASCII (sin tildes) para evitar "M??ximo"
-#
-# Requisitos:
-#   pip install numpy opencv-python pyPOACamera
-#   (opcional, recomendado para tildes) pip install opencv-contrib-python
-#
-# Uso:
-#   python app.py
+"""Herramienta de live stacking (shift-and-add) para Player One Mars-C.
+
+Este módulo vive en `astrostack.tools` como ejemplo auxiliar y no forma parte del
+flujo principal de AstroStack; en instalaciones de producción puedes excluir
+esta carpeta de la distribución.
+
+Requisitos:
+  pip install numpy opencv-python pyPOACamera
+  (opcional, recomendado para tildes) pip install opencv-contrib-python
+
+Uso:
+  python -m astrostack.tools.live_stack_app
+"""
 
 from __future__ import annotations
 
@@ -37,11 +26,11 @@ import numpy as np
 import cv2
 from scipy.ndimage import gaussian_filter, binary_dilation, generate_binary_structure
 
-PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
-from astrostack import pyPOACamera
+from astrostack.tools import pyPOACamera
 from astrostack.stacking import StackingConfig, StackingEngine
 from astrostack.plate_solve_pipeline import run_pipeline
 

@@ -5,7 +5,7 @@ import numpy as np
 from enum import Enum
 #dll = cdll.LoadLibrary("./PlayerOneCamera.dll") # Windows, if your python is 64bit, please copy dll file from lib\x64 folder, if python is 32bit, copy dll file from lib\x86
 #dll = cdll.LoadLibrary("./libPlayerOneCamera.so") # Linux, please copy the 4 'so' files of the corresponding architecture, eg: if your Linux is arm64(aarch64) architecture, please copy the 4 'so' files from lib\arm64
-_LIB_ROOT = Path(__file__).resolve().parent.parent
+_LIB_ROOT = Path(__file__).resolve().parents[2]
 _MAC_LIB_CANDIDATES = ("libPlayerOneCamera.dylib", "libPlayerOneCamera.3.9.0.dylib")
 for _lib_name in _MAC_LIB_CANDIDATES:
     _candidate = _LIB_ROOT / _lib_name

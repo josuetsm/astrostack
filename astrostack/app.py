@@ -22,11 +22,26 @@ import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .arduino import ArduinoController
+from .mount import MountModel
 from .plate_solve_service import PlateSolveResult, PlateSolveSettings, solve_from_stack
 from .preprocessing import StretchConfig, stretch_to_u8
 from .simulations import StarFieldSimulator
 from .stacking import StackingConfig, StackingEngine
+from .star_detection import StarDetectionConfig, detect_stars as detect_stars_candidates
 from .tracking import TrackingConfig, TrackingEngine
+
+try:
+    from astropy.coordinates import AltAz, EarthLocation, SkyCoord, get_body
+    from astropy.time import Time
+    import astropy.units as u
+
+    ASTROPY_OK = True
+except ImportError:
+    ASTROPY_OK = False
+
+SITE_LAT_DEG = -33.4489
+SITE_LON_DEG = -70.6693
+SITE_ELEV_M = 570.0
 
 
 @dataclass
@@ -35,6 +50,7 @@ class AppState:
     last_frame: Optional[np.ndarray] = None
     last_stack: Optional[np.ndarray] = None
     last_plate_result: Optional[PlateSolveResult] = None
+    last_detected_stars: Optional[list[tuple[float, float, float]]] = None
 
 
 class AstroStackApp(QtWidgets.QMainWindow):
@@ -54,8 +70,10 @@ class AstroStackApp(QtWidgets.QMainWindow):
         self.tracker = TrackingEngine(TrackingConfig())
         self.simulator = StarFieldSimulator()
         self.arduino = ArduinoController()
+        self.mount = MountModel()
         self.worker: Optional[threading.Thread] = None
         self.solve_worker: Optional[threading.Thread] = None
+        self.goto_worker: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
 
         self._build_ui()
@@ -339,9 +357,38 @@ class AstroStackApp(QtWidgets.QMainWindow):
 
         layout.addWidget(settings_box)
 
+        detect_row = QtWidgets.QHBoxLayout()
+        self.detect_button = QtWidgets.QPushButton("Detect stars")
+        self.detect_button.clicked.connect(self.detect_stars)
+        detect_row.addWidget(self.detect_button)
+        detect_row.addStretch()
+        layout.addLayout(detect_row)
+
+        detect_box = QtWidgets.QGroupBox("Detection summary")
+        detect_layout = QtWidgets.QVBoxLayout(detect_box)
+        self.detect_detail_label = QtWidgets.QLabel("No detections yet.")
+        detect_layout.addWidget(self.detect_detail_label)
+        layout.addWidget(detect_box)
+
+        preview_box = QtWidgets.QGroupBox("Detection preview")
+        preview_layout = QtWidgets.QVBoxLayout(preview_box)
+        self.detect_preview_label = QtWidgets.QLabel("No detection preview.")
+        self.detect_preview_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.detect_preview_label.setMinimumSize(480, 360)
+        self.detect_preview_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Expanding,
+        )
+        preview_layout.addWidget(self.detect_preview_label)
+        layout.addWidget(preview_box)
+
         self.solve_button = QtWidgets.QPushButton("Solve from current stack")
         self.solve_button.clicked.connect(self.start_plate_solve)
         layout.addWidget(self.solve_button, alignment=QtCore.Qt.AlignLeft)
+
+        self.accept_button = QtWidgets.QPushButton("Accept solution for GoTo")
+        self.accept_button.clicked.connect(self.accept_plate_solution)
+        layout.addWidget(self.accept_button, alignment=QtCore.Qt.AlignLeft)
 
         status_box = QtWidgets.QGroupBox("Solution summary")
         status_layout = QtWidgets.QVBoxLayout(status_box)
@@ -377,6 +424,42 @@ class AstroStackApp(QtWidgets.QMainWindow):
         compute_button = QtWidgets.QPushButton("Compute offset")
         compute_button.clicked.connect(self.compute_goto_offset)
         layout.addWidget(compute_button, alignment=QtCore.Qt.AlignLeft)
+
+        mount_box = QtWidgets.QGroupBox("Mount calibration")
+        mount_layout = QtWidgets.QGridLayout(mount_box)
+        self.microstep_az_input = QtWidgets.QLineEdit(str(self.mount.state.ms_az))
+        self.microstep_alt_input = QtWidgets.QLineEdit(str(self.mount.state.ms_alt))
+        self.sign_az_checkbox = QtWidgets.QCheckBox("Invert AZ sign")
+        self.sign_alt_checkbox = QtWidgets.QCheckBox("Invert ALT sign")
+        mount_layout.addWidget(QtWidgets.QLabel("AZ microsteps"), 0, 0)
+        mount_layout.addWidget(self.microstep_az_input, 0, 1)
+        mount_layout.addWidget(QtWidgets.QLabel("ALT microsteps"), 1, 0)
+        mount_layout.addWidget(self.microstep_alt_input, 1, 1)
+        mount_layout.addWidget(self.sign_az_checkbox, 0, 2)
+        mount_layout.addWidget(self.sign_alt_checkbox, 1, 2)
+        self.apply_mount_button = QtWidgets.QPushButton("Apply mount settings")
+        self.apply_mount_button.clicked.connect(self.apply_mount_settings)
+        mount_layout.addWidget(self.apply_mount_button, 2, 0, 1, 3)
+        layout.addWidget(mount_box)
+
+        objects_box = QtWidgets.QGroupBox("Objects now (Alt/Az)")
+        objects_layout = QtWidgets.QGridLayout(objects_box)
+        self.refresh_objects_button = QtWidgets.QPushButton("Refresh objects")
+        self.refresh_objects_button.clicked.connect(self.refresh_objects)
+        self.objects_combo = QtWidgets.QComboBox()
+        self.objects_combo.addItems(["(none)"])
+        self.goto_delay_az_input = QtWidgets.QLineEdit("220")
+        self.goto_delay_alt_input = QtWidgets.QLineEdit("220")
+        self.goto_objects_button = QtWidgets.QPushButton("GoTo target")
+        self.goto_objects_button.clicked.connect(self.goto_selected_object)
+        objects_layout.addWidget(self.refresh_objects_button, 0, 0)
+        objects_layout.addWidget(self.objects_combo, 0, 1, 1, 3)
+        objects_layout.addWidget(QtWidgets.QLabel("AZ delay (us)"), 1, 0)
+        objects_layout.addWidget(self.goto_delay_az_input, 1, 1)
+        objects_layout.addWidget(QtWidgets.QLabel("ALT delay (us)"), 1, 2)
+        objects_layout.addWidget(self.goto_delay_alt_input, 1, 3)
+        objects_layout.addWidget(self.goto_objects_button, 2, 0, 1, 4)
+        layout.addWidget(objects_box)
 
         status_box = QtWidgets.QGroupBox("GoTo result")
         status_layout = QtWidgets.QVBoxLayout(status_box)
@@ -473,6 +556,29 @@ class AstroStackApp(QtWidgets.QMainWindow):
     def log(self, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
         self.msg_queue.put(f"[{timestamp}] {message}")
+
+    def detect_stars(self) -> None:
+        if self.state.last_stack is None:
+            QtWidgets.QMessageBox.warning(self, "AstroStack", "No stacked image available yet.")
+            return
+        detect_cfg = StarDetectionConfig()
+        preview_u8 = np.ascontiguousarray(stretch_to_u8(self.state.last_stack, StretchConfig()))
+        stars = detect_stars_candidates(preview_u8, config=detect_cfg)
+        self.state.last_detected_stars = [(float(x), float(y), float(score)) for (y, x, score) in stars]
+        count = len(stars)
+        self.detect_detail_label.setText(f"Detected {count} stars.")
+        self.log(f"Detected {count} stars for plate solving.")
+
+        overlay = QtGui.QImage(preview_u8.data, preview_u8.shape[1], preview_u8.shape[0], preview_u8.shape[1], QtGui.QImage.Format_Grayscale8)
+        pixmap = QtGui.QPixmap.fromImage(overlay.copy())
+        painter = QtGui.QPainter(pixmap)
+        pen = QtGui.QPen(QtGui.QColor(0, 255, 0))
+        pen.setWidth(2)
+        painter.setPen(pen)
+        for y, x, _score in stars:
+            painter.drawEllipse(QtCore.QPointF(float(x), float(y)), 6.0, 6.0)
+        painter.end()
+        self.detect_preview_label.setPixmap(pixmap)
 
     def apply_tracking(self) -> None:
         cfg = TrackingConfig(
@@ -695,6 +801,31 @@ class AstroStackApp(QtWidgets.QMainWindow):
         self.solve_status_label.setText("Solved")
         self.log("Plate solve complete.")
 
+    def accept_plate_solution(self) -> None:
+        result = self.state.last_plate_result
+        if result is None or result.center_radec is None:
+            QtWidgets.QMessageBox.warning(self, "AstroStack", "No plate solution available.")
+            return
+        if not ASTROPY_OK:
+            QtWidgets.QMessageBox.warning(self, "AstroStack", "Astropy is required for Alt/Az conversion.")
+            return
+        az_deg, alt_deg = radec_to_altaz(result.center_radec[0], result.center_radec[1])
+        ms_az = self._safe_int(self.microstep_az_input.text(), self.mount.state.ms_az)
+        ms_alt = self._safe_int(self.microstep_alt_input.text(), self.mount.state.ms_alt)
+        self.mount.calibrate(
+            az_center_deg=az_deg,
+            alt_center_deg=alt_deg,
+            az_micro_now=self.mount.state.az_micro,
+            alt_micro_now=self.mount.state.alt_micro,
+            ms_az=ms_az,
+            ms_alt=ms_alt,
+            c_cm_now=self.mount.state.c_cm_cal,
+        )
+        self.goto_detail_label.setText(
+            f"GoTo calibrated at AZ={az_deg:.2f}° ALT={alt_deg:.2f}°"
+        )
+        self.log("GoTo calibration accepted from plate solve.")
+
     def compute_goto_offset(self) -> None:
         result = self.state.last_plate_result
         if result is None or result.center_radec is None:
@@ -710,12 +841,146 @@ class AstroStackApp(QtWidgets.QMainWindow):
         )
         self.log("GoTo offset computed.")
 
+    def apply_mount_settings(self) -> None:
+        ms_az = self._safe_int(self.microstep_az_input.text(), self.mount.state.ms_az)
+        ms_alt = self._safe_int(self.microstep_alt_input.text(), self.mount.state.ms_alt)
+        self.mount.state.ms_az = ms_az
+        self.mount.state.ms_alt = ms_alt
+        self.mount.state.sign_az = -1.0 if self.sign_az_checkbox.isChecked() else 1.0
+        self.mount.state.sign_alt = -1.0 if self.sign_alt_checkbox.isChecked() else 1.0
+        if self.arduino.is_connected:
+            reply = self.arduino.set_microsteps(ms_az, ms_alt)
+            self.log(f"Arduino microsteps updated ({reply or 'no reply'}).")
+        else:
+            self.log("Mount settings updated (Arduino not connected).")
+
+    def refresh_objects(self) -> None:
+        if not ASTROPY_OK:
+            self.log("Astropy not available: objects list disabled.")
+            self.objects_combo.clear()
+            self.objects_combo.addItems(["(none)"])
+            return
+        rows, error = now_planets_altaz()
+        if error is not None:
+            self.log(error)
+            self.objects_combo.clear()
+            self.objects_combo.addItems(["(none)"])
+            return
+        self.objects_combo.clear()
+        if not rows:
+            self.objects_combo.addItems(["(none)"])
+            self.log("No objects above the horizon.")
+            return
+        self.objects_combo.addItems(
+            ["(none)"]
+            + [
+                f"{row['name']} | alt={row['alt_deg']:.1f} az={row['az_deg']:.1f}"
+                for row in rows
+                if row["alt_deg"] > 0
+            ]
+        )
+        self.log(f"Objects refreshed ({len(rows)} total).")
+
+    def goto_selected_object(self) -> None:
+        if self.goto_worker and self.goto_worker.is_alive():
+            self.log("GoTo already running.")
+            return
+        target_text = self.objects_combo.currentText()
+        if target_text == "(none)":
+            self.log("Select a target before GoTo.")
+            return
+        if not ASTROPY_OK:
+            self.log("Astropy not available: GoTo disabled.")
+            return
+        rows, error = now_planets_altaz()
+        if error is not None:
+            self.log(error)
+            return
+        name = target_text.split("|")[0].strip().lower()
+        row = next((r for r in rows if r["name"] == name), None)
+        if row is None:
+            self.log(f"Target '{name}' not found.")
+            return
+        rate_az = self._safe_int(self.goto_delay_az_input.text(), 220)
+        rate_alt = self._safe_int(self.goto_delay_alt_input.text(), 220)
+        self.goto_worker = threading.Thread(
+            target=self._run_goto,
+            args=(row["az_deg"], row["alt_deg"], rate_az, rate_alt),
+            daemon=True,
+        )
+        self.goto_worker.start()
+
+    def _run_goto(self, az_deg: float, alt_deg: float, rate_az_us: int, rate_alt_us: int) -> None:
+        if not self.arduino.is_connected:
+            self.log("GoTo failed: Arduino not connected.")
+            return
+        plan = self.mount.compute_goto(target_az_deg=az_deg, target_alt_deg=alt_deg)
+        if plan is None:
+            self.log("GoTo failed: mount not calibrated.")
+            return
+        d_micro_az, d_micro_alt, da, _c_target, _c_cur = plan
+        delay_az = int(max(200, min(5000, rate_az_us)))
+        delay_alt = int(max(200, min(5000, rate_alt_us)))
+        if abs(d_micro_az) >= 1.0:
+            axis = "A"
+            direction = "FWD" if d_micro_az >= 0 else "REV"
+            steps = int(abs(d_micro_az))
+            self.arduino.rate(0.0, 0.0)
+            self.arduino.move(axis, direction, steps, delay_az)
+            self.mount.apply_move(np.sign(d_micro_az) * steps, 0.0)
+        if abs(d_micro_alt) >= 1.0:
+            axis = "B"
+            direction = "FWD" if d_micro_alt >= 0 else "REV"
+            steps = int(abs(d_micro_alt))
+            self.arduino.rate(0.0, 0.0)
+            self.arduino.move(axis, direction, steps, delay_alt)
+            self.mount.apply_move(0.0, np.sign(d_micro_alt) * steps)
+        self.log(
+            f"GoTo completed: target AZ={az_deg:.2f}° ALT={alt_deg:.2f}° (ΔAZ={da:+.2f}°)."
+        )
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         if self.state.running:
             self.stop_event.set()
         if self.arduino.is_connected:
             self.arduino.disconnect()
         event.accept()
+
+
+def now_planets_altaz() -> tuple[list[dict[str, float | str]], Optional[str]]:
+    if not ASTROPY_OK:
+        return [], "Astropy not available: Alt/Az helpers disabled."
+    loc = EarthLocation(lat=SITE_LAT_DEG * u.deg, lon=SITE_LON_DEG * u.deg, height=SITE_ELEV_M * u.m)
+    t = Time.now()
+    frame = AltAz(obstime=t, location=loc)
+    names = ["moon", "mercury", "venus", "mars", "jupiter", "saturn", "uranus", "neptune"]
+    rows: list[dict[str, float | str]] = []
+    for name in names:
+        try:
+            sc = get_body(name, t, loc).transform_to(frame)
+        except Exception:
+            continue
+        rows.append(
+            {
+                "name": name,
+                "alt_deg": float(sc.alt.deg),
+                "az_deg": float(sc.az.deg),
+                "dist_au": float(sc.distance.to(u.au).value),
+            }
+        )
+    rows.sort(key=lambda r: float(r["alt_deg"]), reverse=True)
+    return rows, None
+
+
+def radec_to_altaz(ra_deg: float, dec_deg: float) -> tuple[float, float]:
+    if not ASTROPY_OK:
+        raise RuntimeError("Astropy not available for RA/Dec -> AltAz conversion.")
+    loc = EarthLocation(lat=SITE_LAT_DEG * u.deg, lon=SITE_LON_DEG * u.deg, height=SITE_ELEV_M * u.m)
+    t = Time.now()
+    frame = AltAz(obstime=t, location=loc)
+    sc = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
+    aa = sc.transform_to(frame)
+    return float(aa.az.deg), float(aa.alt.deg)
 
 
 def main() -> None:

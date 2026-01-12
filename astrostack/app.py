@@ -42,6 +42,7 @@ class AstroStackApp(QtWidgets.QMainWindow):
         self.msg_queue: queue.Queue[str] = queue.Queue()
         self.solve_queue: queue.Queue[tuple[Optional[PlateSolveResult], Optional[str]]] = queue.Queue()
         self.status_queue: queue.Queue[dict[str, str]] = queue.Queue()
+        self.preview_queue: queue.Queue[np.ndarray] = queue.Queue()
 
         self.stacker = StackingEngine(StackingConfig())
         self.tracker = TrackingEngine(TrackingConfig())
@@ -281,10 +282,24 @@ class AstroStackApp(QtWidgets.QMainWindow):
         status_layout.addWidget(self.stack_detail_label)
         layout.addWidget(status_box)
 
+        preview_box = QtWidgets.QGroupBox("Preview")
+        preview_layout = QtWidgets.QVBoxLayout(preview_box)
+        self.preview_label = QtWidgets.QLabel("No preview yet.")
+        self.preview_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.preview_label.setScaledContents(False)
+        self.preview_label.setMinimumSize(640, 480)
+        self.preview_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Expanding,
+        )
+        preview_layout.addWidget(self.preview_label)
+        layout.addWidget(preview_box)
+
         save_button = QtWidgets.QPushButton("Save stacked image")
         save_button.clicked.connect(self.save_stack)
         layout.addWidget(save_button, alignment=QtCore.Qt.AlignLeft)
         layout.addStretch()
+        layout.setStretch(4, 1)
 
     def _build_plate_tab(self) -> None:
         layout = QtWidgets.QVBoxLayout(self.tab_solve)
@@ -431,6 +446,24 @@ class AstroStackApp(QtWidgets.QMainWindow):
                 self.stack_status_label.setText(status["stack_status"])
                 self.stack_detail_label.setText(status["stack_detail"])
 
+        while True:
+            try:
+                preview = self.preview_queue.get_nowait()
+            except queue.Empty:
+                break
+            preview = np.ascontiguousarray(preview)
+            if preview.ndim == 2:
+                height, width = preview.shape
+                image_format = QtGui.QImage.Format_Grayscale8
+                bytes_per_line = width
+            else:
+                height, width, channels = preview.shape
+                image_format = QtGui.QImage.Format_RGB888
+                bytes_per_line = width * channels
+            qimage = QtGui.QImage(preview.data, width, height, bytes_per_line, image_format)
+            pixmap = QtGui.QPixmap.fromImage(qimage.copy())
+            self.preview_label.setPixmap(pixmap)
+
     def log(self, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
         self.msg_queue.put(f"[{timestamp}] {message}")
@@ -574,6 +607,7 @@ class AstroStackApp(QtWidgets.QMainWindow):
 
                 if stack_img is not None:
                     preview = stretch_to_u8(stack_img, stretch_cfg)
+                    self.preview_queue.put(preview.copy())
                     self.log(f"Preview refreshed ({preview.shape[1]}x{preview.shape[0]}).")
                 last_update = now
             time.sleep(0.03)

@@ -16,7 +16,7 @@ class PlateSolveSettings:
     radius_deg: float = 1.0
     gmax: float = 12.0
     pixel_size_um: float = 2.9
-    focal_length_mm: float = 400.0
+    focal_length_mm: float = 900.0
     tol_rel: float = 0.05
     max_per_pair: int = 200
     arcsec_err_cap: float = 0.05

@@ -279,7 +279,7 @@ class AstroStackApp(QtWidgets.QMainWindow):
             "radius_deg": QtWidgets.QLineEdit("1.0"),
             "gmax": QtWidgets.QLineEdit("12.0"),
             "pixel_um": QtWidgets.QLineEdit("2.9"),
-            "focal_mm": QtWidgets.QLineEdit("400.0"),
+            "focal_mm": QtWidgets.QLineEdit("900.0"),
             "max_gaia": QtWidgets.QLineEdit("8000"),
         }
 
@@ -545,7 +545,7 @@ class AstroStackApp(QtWidgets.QMainWindow):
             radius_deg=self._safe_float(self.solve_inputs["radius_deg"].text(), 1.0),
             gmax=self._safe_float(self.solve_inputs["gmax"].text(), 12.0),
             pixel_size_um=self._safe_float(self.solve_inputs["pixel_um"].text(), 2.9),
-            focal_length_mm=self._safe_float(self.solve_inputs["focal_mm"].text(), 400.0),
+            focal_length_mm=self._safe_float(self.solve_inputs["focal_mm"].text(), 900.0),
             max_gaia_sources=self._safe_int(self.solve_inputs["max_gaia"].text(), 8000),
         )
 

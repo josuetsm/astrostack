@@ -42,6 +42,13 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from astrostack import pyPOACamera
+from astrostack.preprocessing import (
+    local_zscore_u16,
+    make_sparse_reg,
+    pyramid_phasecorr_delta,
+    remove_hot_pixels,
+    warp_translate,
+)
 from astrostack.plate_solve_pipeline import run_pipeline
 
 cv2.setUseOptimized(True)
@@ -200,28 +207,6 @@ def ensure_gray_u8(img: np.ndarray) -> np.ndarray:
 
     g = np.clip(gray.astype(np.float32), 0, 255)
     return g.astype(np.uint8)
-
-
-def dog_highpass(gray_u8: np.ndarray, s1: float = 1.2, s2: float = 3.0) -> np.ndarray:
-    g = gray_u8.astype(np.float32) / 255.0
-    a = cv2.GaussianBlur(g, (0, 0), s1)
-    b = cv2.GaussianBlur(g, (0, 0), s2)
-    return (a - b).astype(np.float32)
-
-
-def sharpness_laplacian(gray_u8: np.ndarray) -> float:
-    return float(cv2.Laplacian(gray_u8, cv2.CV_32F).var())
-
-
-def phase_corr_shift(ref_hp: np.ndarray, img_hp: np.ndarray) -> Tuple[float, float, float]:
-    (dx, dy), response = cv2.phaseCorrelate(ref_hp, img_hp)
-    return float(dx), float(dy), float(response)
-
-
-def warp_shift(img_f32: np.ndarray, dx: float, dy: float) -> np.ndarray:
-    H, W = img_f32.shape[:2]
-    M = np.array([[1, 0, dx], [0, 1, dy]], dtype=np.float32)
-    return cv2.warpAffine(img_f32, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
 
 def percentile_stretch_u8(img_u8: np.ndarray, lo: float = 1.0, hi: float = 99.5) -> np.ndarray:
@@ -569,18 +554,15 @@ def demosaic_raw8(raw: np.ndarray, pattern: str, want_color: bool, hq: bool) -> 
 @dataclass
 class StackConfig:
     roi: int = 0
-    max_shift_frac: float = 0.95
-    allow_expand: bool = True
-
-    min_sharpness: float = 2.0
-    min_response_lock: float = 0.02
-    min_response_reacq: float = 0.03
-    min_star_proxy: int = 2
-
-    update_ref_every_accepted: int = 50
-
-    use_quality_weight: bool = True
-    weight_clip: Tuple[float, float] = (0.25, 2.0)
+    sigma_bg: float = 35.0
+    sigma_floor_p: float = 10.0
+    z_clip: float = 6.0
+    peak_p: float = 99.75
+    peak_blur: float = 1.0
+    resp_min: float = 0.05
+    max_rad: float = 400.0
+    hot_z: float = 12.0
+    hot_max: int = 200
 
 
 class LiveStacker:
@@ -589,179 +571,96 @@ class LiveStacker:
         self.reset()
 
     def reset(self):
-        self.state = "LOCKED"
-        self.paused = False
-        self.ref_gray_u8: Optional[np.ndarray] = None
-        self.ref_hp: Optional[np.ndarray] = None
+        self.state = "PAUSED"
+        self.paused = True
+        self.ref_reg: Optional[np.ndarray] = None
         self.acc_sum: Optional[np.ndarray] = None
         self.acc_w: Optional[np.ndarray] = None
-        self.ref_origin = (0, 0)
+        self.ones: Optional[np.ndarray] = None
         self.frame_shape: Optional[Tuple[int, int]] = None
 
-        self.seen = 0
-        self.accepted = 0
+        self.frames_total = 0
+        self.frames_used = 0
         self.last_dxdy = (0.0, 0.0)
-        self.last_scores = (0.0, 0.0)
-        self.last_star_proxy = 0
+        self.last_resp = 0.0
+        self.last_used = 0
 
-    def _init_ref(self, gray_u8: np.ndarray):
-        gray_u8 = gray_u8.astype(np.uint8, copy=False)
-        self.ref_gray_u8 = gray_u8.copy()
-        self.ref_hp = dog_highpass(self.ref_gray_u8)
-        H, W = gray_u8.shape[:2]
-        self.acc_sum = np.zeros((H, W), dtype=np.float32)
-        self.acc_w = np.zeros((H, W), dtype=np.float32)
-        self.ref_origin = (0, 0)
-        self.frame_shape = (H, W)
+    def _ensure_stack(self, height: int, width: int) -> None:
+        if self.acc_sum is None or self.acc_w is None or self.ones is None:
+            self.acc_sum = np.zeros((height, width), dtype=np.float32)
+            self.acc_w = np.zeros((height, width), dtype=np.float32)
+            self.ones = np.ones((height, width), dtype=np.float32)
+            self.frame_shape = (height, width)
 
-    def _compute_weight(self, response: float, sharp: float) -> float:
-        if not self.cfg.use_quality_weight:
-            return 1.0
-        w = (response / max(self.cfg.min_response_lock, 1e-6)) * (sharp / max(self.cfg.min_sharpness, 1e-6))
-        return float(np.clip(w, self.cfg.weight_clip[0], self.cfg.weight_clip[1]))
-
-    def _ensure_canvas(self, top: int, left: int, bottom: int, right: int):
-        if self.acc_sum is None or self.acc_w is None:
-            return
-        Hc, Wc = self.acc_sum.shape[:2]
-        pad_top = max(0, -top)
-        pad_left = max(0, -left)
-        pad_bottom = max(0, bottom - Hc)
-        pad_right = max(0, right - Wc)
-        if pad_top or pad_left or pad_bottom or pad_right:
-            self.acc_sum = np.pad(
-                self.acc_sum,
-                ((pad_top, pad_bottom), (pad_left, pad_right)),
-                mode="constant",
-                constant_values=0.0,
-            )
-            self.acc_w = np.pad(
-                self.acc_w,
-                ((pad_top, pad_bottom), (pad_left, pad_right)),
-                mode="constant",
-                constant_values=0.0,
-            )
-            oy, ox = self.ref_origin
-            self.ref_origin = (oy + pad_top, ox + pad_left)
-
-    def _stack_region_for_ref(self, st: np.ndarray) -> Optional[np.ndarray]:
-        if self.frame_shape is None:
-            return None
-        H, W = self.frame_shape
-        oy, ox = self.ref_origin
-        if oy < 0 or ox < 0:
-            return None
-        if oy + H > st.shape[0] or ox + W > st.shape[1]:
-            return None
-        return st[oy:oy + H, ox:ox + W]
-
-    def _update_ref_from_stack(self):
-        st = self.get_stack_u8(raw=True)
-        if st is None:
-            return
-        ref = self._stack_region_for_ref(st)
-        if ref is None:
-            return
-        self.ref_gray_u8 = ref
-        self.ref_hp = dog_highpass(self.ref_gray_u8)
-
-    def process(self, gray_u8: np.ndarray):
-        gray_u8 = gray_u8.astype(np.uint8, copy=False)
-        self.seen += 1
-        sp = star_proxy_count(gray_u8)
-        self.last_star_proxy = sp
-
-        if self.ref_hp is None:
-            self._init_ref(gray_u8)
-            self.last_scores = (1.0, sharpness_laplacian(gray_u8))
-            self.last_dxdy = (0.0, 0.0)
-            return
-
-        sharp = sharpness_laplacian(gray_u8)
-        img_hp = dog_highpass(gray_u8)
-        dx, dy, resp = phase_corr_shift(self.ref_hp, img_hp)
-
-        self.last_dxdy = (dx, dy)
-        self.last_scores = (resp, sharp)
-
-        H, W = gray_u8.shape[:2]
-        max_shift = self.cfg.max_shift_frac * min(H, W)
-        too_far = (abs(dx) > max_shift) or (abs(dy) > max_shift)
-
+    def process(self, frame_u16: np.ndarray) -> None:
+        frame_u16 = frame_u16.astype(np.uint16, copy=False)
+        self.frames_total += 1
         if self.paused:
+            self.state = "PAUSED"
+            return
+        self.state = "ACTIVE"
+
+        cfg = self.cfg
+
+        frame_fix = remove_hot_pixels(frame_u16, hot_z=float(cfg.hot_z), hot_max=int(cfg.hot_max))
+        z = local_zscore_u16(
+            frame_fix,
+            sigma_bg=float(cfg.sigma_bg),
+            floor_p=float(cfg.sigma_floor_p),
+            z_clip=float(cfg.z_clip),
+        )
+        reg = make_sparse_reg(z, peak_p=float(cfg.peak_p), blur_sigma=float(cfg.peak_blur), hot_mask=None)
+
+        self._ensure_stack(frame_fix.shape[0], frame_fix.shape[1])
+        if self.acc_sum is None or self.acc_w is None or self.ones is None:
             return
 
-        if self.state == "LOCKED":
-            star_gate = (self.cfg.min_star_proxy > 0) and (sp < self.cfg.min_star_proxy)
-            if (not self.cfg.allow_expand and too_far) or resp < self.cfg.min_response_lock or star_gate:
-                self.state = "LOST"
-                return
-            if sharp < self.cfg.min_sharpness:
-                return
-
-            w = self._compute_weight(resp, sharp)
-            if self.acc_sum is None or self.acc_w is None:
-                self._init_ref(gray_u8)
-                return
-
-            oy, ox = self.ref_origin
-            top = int(np.floor(oy + dy))
-            left = int(np.floor(ox + dx))
-            bottom = int(np.ceil(oy + dy + H))
-            right = int(np.ceil(ox + dx + W))
-            if self.cfg.allow_expand:
-                self._ensure_canvas(top, left, bottom, right)
-                oy, ox = self.ref_origin
-
-            Hc, Wc = self.acc_sum.shape[:2]
-            M = np.array([[1, 0, ox + dx], [0, 1, oy + dy]], dtype=np.float32)
-            aligned = cv2.warpAffine(
-                gray_u8.astype(np.float32),
-                M,
-                (Wc, Hc),
-                flags=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=0,
-            )
-            mask = cv2.warpAffine(
-                np.ones((H, W), dtype=np.float32),
-                M,
-                (Wc, Hc),
-                flags=cv2.INTER_NEAREST,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=0,
-            )
-            self.acc_sum += aligned * w
-            self.acc_w += mask * w
-            self.accepted += 1
-
-            if self.accepted % max(5, self.cfg.update_ref_every_accepted) == 0:
-                self._update_ref_from_stack()
+        if self.ref_reg is None:
+            self.ref_reg = reg.astype(np.float32).copy()
+            dx = dy = 0.0
+            resp = 1.0
+            used = True
+            warped = frame_fix.astype(np.float32)
+            wmask = self.ones.copy()
         else:
-            star_gate = (self.cfg.min_star_proxy > 0) and (sp < self.cfg.min_star_proxy)
-            if (self.cfg.allow_expand or not too_far) and (resp >= self.cfg.min_response_reacq) and (not star_gate):
-                self._init_ref(gray_u8)
-                self.state = "LOCKED"
+            dx, dy, resp = pyramid_phasecorr_delta(
+                self.ref_reg.astype(np.float32),
+                reg.astype(np.float32),
+                levels=3,
+            )
+            rad = float(np.hypot(dx, dy))
+            used = True
+            if (resp < float(cfg.resp_min)) or (rad > float(cfg.max_rad)) or (not np.isfinite(rad)):
+                used = False
+                warped = None
+                wmask = None
+            else:
+                warped = warp_translate(frame_fix.astype(np.float32), dx, dy, is_mask=False)
+                wmask = warp_translate(self.ones, dx, dy, is_mask=True)
 
-    def get_stack_u8(self, raw: bool = False) -> Optional[np.ndarray]:
+        self.last_dxdy = (float(dx), float(dy))
+        self.last_resp = float(resp)
+        self.last_used = int(used)
+
+        if used and warped is not None and wmask is not None:
+            self.frames_used += 1
+            self.acc_sum += warped
+            self.acc_w += wmask
+
+    def get_stack_u16(self) -> Optional[np.ndarray]:
         if self.acc_sum is None or self.acc_w is None or not np.any(self.acc_w > 0):
             return None
         denom = np.maximum(self.acc_w, 1e-6)
         img = self.acc_sum / denom
         img = np.where(self.acc_w > 0, img, 0.0)
-        return np.clip(img, 0, 255).astype(np.uint8)
+        return np.clip(img, 0, 65535).astype(np.uint16)
 
     def overlay_lines(self) -> List[str]:
-        resp, sharp = self.last_scores
         dx, dy = self.last_dxdy
-        canvas = ""
-        if self.acc_sum is not None:
-            Hc, Wc = self.acc_sum.shape[:2]
-            canvas = f"   Canvas={Wc}x{Hc}"
         return [
-            f"STATE: {self.state}   {'PAUSED' if self.paused else 'RUNNING'}{canvas}",
-            f"Frames: seen={self.seen}   accepted={self.accepted}",
-            f"Score: resp={resp:.3f}   sharp={sharp:.2f}   stars~{self.last_star_proxy}",
+            f"STATE: {self.state}   {'PAUSED' if self.paused else 'RUNNING'}",
+            f"Frames: total={self.frames_total}   used={self.frames_used}",
+            f"Score: resp={self.last_resp:.3f}   used={self.last_used}",
             f"Shift: dx={dx:.2f}   dy={dy:.2f}",
         ]
 
@@ -1499,13 +1398,10 @@ class Params:
     auto_contrast: bool = False
     gamma: float = 1.40
 
-    min_sharpness: float = 2.0
-    resp_lock: float = 0.010
-    resp_reacq: float = 0.015
-    max_shift_pct: int = 35
-    ref_update_every: int = 50
-    min_stars_proxy: int = 0
-    weight: bool = True
+    stack_resp_min: float = 0.05
+    stack_max_rad: float = 400.0
+    stack_hot_z: float = 12.0
+    stack_hot_max: int = 200
 
     # Debayer
     debayer: bool = True
@@ -1558,7 +1454,7 @@ def main(outdir: str = "captures", roi: int = 0, binning: int = 1, solve_cfg: Op
     def act_reset(): stacker.reset()
     def act_pause(): stacker.paused = not stacker.paused
     def act_save_stack():
-        st = stacker.get_stack_u8(raw=True)
+        st = stacker.get_stack_u16()
         if st is None:
             return
         saved["stack"] += 1
@@ -1581,8 +1477,8 @@ def main(outdir: str = "captures", roi: int = 0, binning: int = 1, solve_cfg: Op
 
     ui.add_button(Button("connect", "Conectar", (0, 0, 1, 1), act_connect, tooltip="Conecta/desconecta la camara."))
     ui.add_button(Button("reset", "Reset", (0, 0, 1, 1), act_reset, tooltip="Reinicia referencia y acumulador."))
-    ui.add_button(Button("pause", "Pause", (0, 0, 1, 1), act_pause, tooltip="Pausa/continua el acumulado.", toggled=lambda: stacker.paused))
-    ui.add_button(Button("savestack", "SaveStack", (0, 0, 1, 1), act_save_stack, tooltip="Guarda el stack actual (PNG 8-bit)."))
+    ui.add_button(Button("pause", "Pause", (0, 0, 1, 1), act_pause, tooltip="Inicia/pausa el stacking (no parte automaticamente).", toggled=lambda: stacker.paused))
+    ui.add_button(Button("savestack", "SaveStack", (0, 0, 1, 1), act_save_stack, tooltip="Guarda el stack actual (PNG 16-bit)."))
     ui.add_button(Button("savelive", "SaveLive", (0, 0, 1, 1), act_save_live, tooltip="Guarda la vista LIVE actual (PNG)."))
     ui.add_button(Button("solve", "Solve", (0, 0, 1, 1), lambda: solve_request.update(pending=True), tooltip="Captura y plate solve (Gaia)."))
     ui.add_button(Button("quit", "Quit", (0, 0, 1, 1), act_quit, tooltip="Salir."))
@@ -1633,52 +1529,32 @@ def main(outdir: str = "captures", roi: int = 0, binning: int = 1, solve_cfg: Op
     ))
 
     ui.add_control(SpinnerControl(
-        key="minsharp", label="Min Sharp",
-        tooltip="Umbral de nitidez (varianza Laplaciano). | Filtra frames borrosos. | Baja si no acumula.",
+        key="stackresp", label="Stack RESP_MIN",
+        tooltip="Umbral minimo de respuesta para aceptar el frame en el stack.",
         rect=(0, 0, 1, 1),
-        getter=lambda: p.min_sharpness, setter=lambda v: setattr(p, "min_sharpness", float(v)),
-        vmin=0.0, vmax=50.0, step=0.1, step_fast=1.0, fmt="{:.1f}"
+        getter=lambda: p.stack_resp_min, setter=lambda v: setattr(p, "stack_resp_min", float(v)),
+        vmin=0.0, vmax=0.40, step=0.005, step_fast=0.02, fmt="{:.3f}"
     ))
     ui.add_control(SpinnerControl(
-        key="resplock", label="Resp Lock",
-        tooltip="Umbral de correlacion para permanecer LOCKED. | Mas alto = mas estricto. | Baja si resp es baja.",
+        key="stackrad", label="Stack MAX_RAD",
+        tooltip="Maximo desplazamiento permitido (pixeles) para aceptar el frame.",
         rect=(0, 0, 1, 1),
-        getter=lambda: p.resp_lock, setter=lambda v: setattr(p, "resp_lock", float(v)),
-        vmin=0.0, vmax=0.20, step=0.001, step_fast=0.010, fmt="{:.3f}"
+        getter=lambda: p.stack_max_rad, setter=lambda v: setattr(p, "stack_max_rad", float(v)),
+        vmin=10.0, vmax=3000.0, step=5.0, step_fast=50.0, fmt="{:.1f}"
     ))
     ui.add_control(SpinnerControl(
-        key="respreacq", label="Resp Reacq",
-        tooltip="Umbral de correlacion para salir de LOST. | Normalmente >= RespLock.",
+        key="hotz", label="Hot-pixel Z",
+        tooltip="Umbral Z para reemplazo de hot pixels (por frame).",
         rect=(0, 0, 1, 1),
-        getter=lambda: p.resp_reacq, setter=lambda v: setattr(p, "resp_reacq", float(v)),
-        vmin=0.0, vmax=0.25, step=0.001, step_fast=0.010, fmt="{:.3f}"
+        getter=lambda: p.stack_hot_z, setter=lambda v: setattr(p, "stack_hot_z", float(v)),
+        vmin=4.0, vmax=40.0, step=0.5, step_fast=2.0, fmt="{:.1f}"
     ))
     ui.add_control(SpinnerControl(
-        key="maxshift", label="Max Shift (%)",
-        tooltip="Maximo shift antes de LOST. | Sube si deriva mucho. | Baja si hay aligns falsos.",
+        key="hotmax", label="Hot-pixel Max",
+        tooltip="Maximo de hot pixels a corregir por frame.",
         rect=(0, 0, 1, 1),
-        getter=lambda: p.max_shift_pct, setter=lambda v: setattr(p, "max_shift_pct", int(v)),
-        vmin=5, vmax=60, step=1, step_fast=5, fmt="{:.0f}", unit="%"
-    ))
-    ui.add_control(SpinnerControl(
-        key="refupd", label="Ref Update",
-        tooltip="Cada N frames aceptados, actualiza referencia con el stack. | Ayuda con deriva lenta.",
-        rect=(0, 0, 1, 1),
-        getter=lambda: p.ref_update_every, setter=lambda v: setattr(p, "ref_update_every", int(v)),
-        vmin=5, vmax=300, step=1, step_fast=10, fmt="{:.0f}"
-    ))
-    ui.add_control(SpinnerControl(
-        key="minstars", label="Min Stars",
-        tooltip="Proxy minimo de estrellas para LOCKED/reacquire. | 0 = desactiva gate. | Baja si el campo tiene pocas estrellas.",
-        rect=(0, 0, 1, 1),
-        getter=lambda: p.min_stars_proxy, setter=lambda v: setattr(p, "min_stars_proxy", int(v)),
-        vmin=0, vmax=30, step=1, step_fast=5, fmt="{:.0f}"
-    ))
-    ui.add_control(ToggleControl(
-        key="weight", label="Quality Weight",
-        tooltip="Pesa frames por (resp * sharp). | Puede mejorar stack si hay frames muy malos.",
-        rect=(0, 0, 1, 1),
-        getter=lambda: p.weight, setter=lambda b: setattr(p, "weight", bool(b)),
+        getter=lambda: p.stack_hot_max, setter=lambda v: setattr(p, "stack_hot_max", int(v)),
+        vmin=0, vmax=5000, step=10, step_fast=100, fmt="{:.0f}"
     ))
     ui.add_control(ToggleControl(
         key="autoc", label="Auto Contrast",
@@ -1877,13 +1753,10 @@ def main(outdir: str = "captures", roi: int = 0, binning: int = 1, solve_cfg: Op
             ui.tick_repeat()
 
             # mirror params -> cfg
-            cfg.min_sharpness = float(p.min_sharpness)
-            cfg.min_response_lock = float(p.resp_lock)
-            cfg.min_response_reacq = float(p.resp_reacq)
-            cfg.max_shift_frac = float(p.max_shift_pct) / 100.0
-            cfg.update_ref_every_accepted = int(p.ref_update_every)
-            cfg.min_star_proxy = int(p.min_stars_proxy)
-            cfg.use_quality_weight = bool(p.weight)
+            cfg.resp_min = float(p.stack_resp_min)
+            cfg.max_rad = float(p.stack_max_rad)
+            cfg.hot_z = float(p.stack_hot_z)
+            cfg.hot_max = int(p.stack_hot_max)
 
             apply_camera_settings(force=False)
 
@@ -1920,10 +1793,11 @@ def main(outdir: str = "captures", roi: int = 0, binning: int = 1, solve_cfg: Op
                         last_live_holder["bgr"] = live_bgr
 
                         try:
-                            stacker.process(gray_u8)
+                            frame_u16 = (gray_u8.astype(np.uint16) << 8)
+                            stacker.process(frame_u16)
                         except Exception as e:
                             print("Warning: stacker.process failed:", repr(e))
-                            stacker.state = "LOST"
+                            stacker.state = "ERROR"
 
                         if solve_request["pending"]:
                             solve_request["pending"] = False
@@ -2018,18 +1892,21 @@ def main(outdir: str = "captures", roi: int = 0, binning: int = 1, solve_cfg: Op
                 live_disp = live_bgr.copy()
 
             # STACK display
-            st_raw = stacker.get_stack_u8(raw=True)
+            st_raw = stacker.get_stack_u16()
             if st_raw is None:
                 st_disp = None
             else:
-                st_disp = percentile_stretch_u8(st_raw, 1.0, 99.5) if p.auto_contrast else st_raw
+                if p.auto_contrast:
+                    st_disp = percentile_stretch_u8(st_raw, 1.0, 99.5)
+                else:
+                    st_disp = np.clip(st_raw >> 8, 0, 255).astype(np.uint8)
                 st_disp = apply_gamma_u8(st_disp, gamma)
 
             now = time.time()
             if now - last_report > 1.0:
                 dt = now - t0
-                fps_in = stacker.seen / dt if dt > 0 else 0.0
-                fps_acc = stacker.accepted / dt if dt > 0 else 0.0
+                fps_in = stacker.frames_total / dt if dt > 0 else 0.0
+                fps_acc = stacker.frames_used / dt if dt > 0 else 0.0
                 last_report = now
 
             model = camera["model"]
@@ -2045,8 +1922,8 @@ def main(outdir: str = "captures", roi: int = 0, binning: int = 1, solve_cfg: Op
             footer_right = f"FPS in: {fps_in:.1f}   FPS acc: {fps_acc:.1f}"
 
             info = stacker.overlay_lines()
-            info.append(f"Gates: sharp>={cfg.min_sharpness:.1f}  lock>={cfg.min_response_lock:.3f}  reacq>={cfg.min_response_reacq:.3f}")
-            info.append(f"MaxShift={cfg.max_shift_frac:.2f}  RefUpd={cfg.update_ref_every_accepted}  StarsMin={cfg.min_star_proxy}  Weight={cfg.use_quality_weight}")
+            info.append(f"Gates: resp>={cfg.resp_min:.3f}  max_rad={cfg.max_rad:.1f}px")
+            info.append(f"HotPix: z>{cfg.hot_z:.1f}  max={cfg.hot_max}")
             if last_solve_metrics["metrics"] is not None:
                 met = last_solve_metrics["metrics"]
                 info.append(f"Solve: err_med={met.get('err_median', -1):.3f}\"  err_max={met.get('err_max', -1):.3f}\"  n_img={met.get('n_img', 0)}")

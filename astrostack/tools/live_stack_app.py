@@ -15,7 +15,6 @@ Uso:
 from __future__ import annotations
 
 import argparse
-import sys
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -26,13 +25,9 @@ import numpy as np
 import cv2
 from scipy.ndimage import gaussian_filter, binary_dilation, generate_binary_structure
 
-PACKAGE_ROOT = Path(__file__).resolve().parents[2]
-if str(PACKAGE_ROOT) not in sys.path:
-    sys.path.insert(0, str(PACKAGE_ROOT))
-
-from astrostack.tools import pyPOACamera
-from astrostack.stacking import StackingConfig, StackingEngine
-from astrostack.plate_solve_pipeline import run_pipeline
+from ..plate_solve_pipeline import run_pipeline
+from ..stacking import StackingConfig, StackingEngine
+from . import pyPOACamera
 
 cv2.setUseOptimized(True)
 

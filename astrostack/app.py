@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-
 import numpy as np
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from .plate_solve_service import PlateSolveResult, PlateSolveSettings, solve_from_stack
 from .preprocessing import StretchConfig, stretch_to_u8
@@ -26,18 +25,12 @@ class AppState:
     last_plate_result: Optional[PlateSolveResult] = None
 
 
-class AstroStackApp:
-    def __init__(self, root: tk.Tk) -> None:
-        self.root = root
-        self.root.title("AstroStack")
-        self.root.geometry("1120x760")
-        self.root.minsize(980, 680)
-
-        self.style = ttk.Style(self.root)
-        if "aqua" in self.style.theme_names():
-            self.style.theme_use("aqua")
-        elif "clam" in self.style.theme_names():
-            self.style.theme_use("clam")
+class AstroStackApp(QtWidgets.QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("AstroStack")
+        self.resize(1120, 760)
+        self.setMinimumSize(980, 680)
 
         self.state = AppState()
         self.msg_queue: queue.Queue[str] = queue.Queue()
@@ -52,33 +45,48 @@ class AstroStackApp:
         self.stop_event = threading.Event()
 
         self._build_ui()
-        self._poll_messages()
+
+        self.poll_timer = QtCore.QTimer(self)
+        self.poll_timer.setInterval(200)
+        self.poll_timer.timeout.connect(self._poll_messages)
+        self.poll_timer.start()
 
     def _build_ui(self) -> None:
-        header = ttk.Frame(self.root, padding=16)
-        header.pack(side=tk.TOP, fill=tk.X)
+        container = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(container)
+        layout.setContentsMargins(12, 12, 12, 12)
 
-        title = ttk.Label(header, text="AstroStack", font=("SF Pro Display", 22, "bold"))
-        subtitle = ttk.Label(header, text="Tracking · Stacking · Plate Solving · GoTo")
-        title.pack(anchor="w")
-        subtitle.pack(anchor="w")
+        header = QtWidgets.QFrame()
+        header_layout = QtWidgets.QVBoxLayout(header)
+        header_layout.setContentsMargins(4, 4, 4, 4)
 
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        title = QtWidgets.QLabel("AstroStack")
+        title_font = QtGui.QFont()
+        title_font.setPointSize(22)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        subtitle = QtWidgets.QLabel("Tracking · Stacking · Plate Solving · GoTo")
+        header_layout.addWidget(title)
+        header_layout.addWidget(subtitle)
 
-        self.tab_overview = ttk.Frame(notebook)
-        self.tab_tracking = ttk.Frame(notebook)
-        self.tab_stacking = ttk.Frame(notebook)
-        self.tab_solve = ttk.Frame(notebook)
-        self.tab_goto = ttk.Frame(notebook)
-        self.tab_logs = ttk.Frame(notebook)
+        layout.addWidget(header)
 
-        notebook.add(self.tab_overview, text="Overview")
-        notebook.add(self.tab_tracking, text="Tracking")
-        notebook.add(self.tab_stacking, text="Stacking")
-        notebook.add(self.tab_solve, text="Plate Solve")
-        notebook.add(self.tab_goto, text="GoTo")
-        notebook.add(self.tab_logs, text="Logs")
+        self.tabs = QtWidgets.QTabWidget()
+        layout.addWidget(self.tabs)
+
+        self.tab_overview = QtWidgets.QWidget()
+        self.tab_tracking = QtWidgets.QWidget()
+        self.tab_stacking = QtWidgets.QWidget()
+        self.tab_solve = QtWidgets.QWidget()
+        self.tab_goto = QtWidgets.QWidget()
+        self.tab_logs = QtWidgets.QWidget()
+
+        self.tabs.addTab(self.tab_overview, "Overview")
+        self.tabs.addTab(self.tab_tracking, "Tracking")
+        self.tabs.addTab(self.tab_stacking, "Stacking")
+        self.tabs.addTab(self.tab_solve, "Plate Solve")
+        self.tabs.addTab(self.tab_goto, "GoTo")
+        self.tabs.addTab(self.tab_logs, "Logs")
 
         self._build_overview_tab()
         self._build_tracking_tab()
@@ -87,211 +95,263 @@ class AstroStackApp:
         self._build_goto_tab()
         self._build_logs_tab()
 
+        self.setCentralWidget(container)
+
     def _build_overview_tab(self) -> None:
-        frame = ttk.Frame(self.tab_overview, padding=20)
-        frame.pack(fill=tk.BOTH, expand=True)
+        layout = QtWidgets.QVBoxLayout(self.tab_overview)
+        layout.setContentsMargins(20, 20, 20, 20)
 
-        status_frame = ttk.LabelFrame(frame, text="Session status", padding=12)
-        status_frame.pack(fill=tk.X)
+        status_box = QtWidgets.QGroupBox("Session status")
+        status_layout = QtWidgets.QGridLayout(status_box)
 
-        self.capture_status_var = tk.StringVar(value="Idle")
-        self.stack_status_var = tk.StringVar(value="No stack yet")
-        self.track_status_var = tk.StringVar(value="No tracking yet")
-        self.solve_status_var = tk.StringVar(value="No plate solve yet")
+        self.capture_status_label = QtWidgets.QLabel("Idle")
+        self.stack_status_label = QtWidgets.QLabel("No stack yet")
+        self.track_status_label = QtWidgets.QLabel("No tracking yet")
+        self.solve_status_label = QtWidgets.QLabel("No plate solve yet")
 
-        for row, (label, var) in enumerate(
-            [
-                ("Capture", self.capture_status_var),
-                ("Tracking", self.track_status_var),
-                ("Stacking", self.stack_status_var),
-                ("Plate Solve", self.solve_status_var),
-            ]
-        ):
-            ttk.Label(status_frame, text=label, font=("SF Pro Text", 12, "bold")).grid(
-                row=row, column=0, sticky="w", padx=(0, 8), pady=4
-            )
-            ttk.Label(status_frame, textvariable=var).grid(row=row, column=1, sticky="w", pady=4)
+        labels = [
+            ("Capture", self.capture_status_label),
+            ("Tracking", self.track_status_label),
+            ("Stacking", self.stack_status_label),
+            ("Plate Solve", self.solve_status_label),
+        ]
 
-        controls = ttk.LabelFrame(frame, text="Capture control", padding=12)
-        controls.pack(fill=tk.X, pady=16)
+        for row, (label_text, value_label) in enumerate(labels):
+            label = QtWidgets.QLabel(label_text)
+            label_font = label.font()
+            label_font.setBold(True)
+            label.setFont(label_font)
+            status_layout.addWidget(label, row, 0)
+            status_layout.addWidget(value_label, row, 1)
 
-        source_frame = ttk.Frame(controls)
-        source_frame.pack(fill=tk.X)
-        ttk.Label(source_frame, text="Source").pack(side=tk.LEFT)
-        self.source_var = tk.StringVar(value="Simulation")
-        ttk.OptionMenu(source_frame, self.source_var, "Simulation", "Simulation").pack(
-            side=tk.LEFT, padx=8
-        )
+        layout.addWidget(status_box)
 
-        btn_frame = ttk.Frame(controls)
-        btn_frame.pack(fill=tk.X, pady=(10, 0))
-        self.btn_start = ttk.Button(btn_frame, text="Start capture", command=self.start_capture)
-        self.btn_stop = ttk.Button(btn_frame, text="Stop", command=self.stop_capture, state=tk.DISABLED)
-        self.btn_reset = ttk.Button(btn_frame, text="Reset stack", command=self.reset_stack, state=tk.DISABLED)
-        self.btn_start.pack(side=tk.LEFT, padx=(0, 8))
-        self.btn_stop.pack(side=tk.LEFT, padx=(0, 8))
-        self.btn_reset.pack(side=tk.LEFT)
+        controls = QtWidgets.QGroupBox("Capture control")
+        controls_layout = QtWidgets.QVBoxLayout(controls)
+
+        source_layout = QtWidgets.QHBoxLayout()
+        source_layout.addWidget(QtWidgets.QLabel("Source"))
+        self.source_combo = QtWidgets.QComboBox()
+        self.source_combo.addItems(["Simulation"])
+        source_layout.addWidget(self.source_combo)
+        source_layout.addStretch()
+        controls_layout.addLayout(source_layout)
+
+        button_layout = QtWidgets.QHBoxLayout()
+        self.btn_start = QtWidgets.QPushButton("Start capture")
+        self.btn_start.clicked.connect(self.start_capture)
+        self.btn_stop = QtWidgets.QPushButton("Stop")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self.stop_capture)
+        self.btn_reset = QtWidgets.QPushButton("Reset stack")
+        self.btn_reset.setEnabled(False)
+        self.btn_reset.clicked.connect(self.reset_stack)
+        button_layout.addWidget(self.btn_start)
+        button_layout.addWidget(self.btn_stop)
+        button_layout.addWidget(self.btn_reset)
+        button_layout.addStretch()
+        controls_layout.addLayout(button_layout)
+
+        layout.addWidget(controls)
+        layout.addStretch()
 
     def _build_tracking_tab(self) -> None:
-        frame = ttk.Frame(self.tab_tracking, padding=20)
-        frame.pack(fill=tk.BOTH, expand=True)
+        layout = QtWidgets.QVBoxLayout(self.tab_tracking)
+        layout.setContentsMargins(20, 20, 20, 20)
 
-        ttk.Label(frame, text="Tracking configuration", font=("SF Pro Text", 14, "bold")).pack(anchor="w")
-        config_frame = ttk.LabelFrame(frame, text="Phase correlation preprocessing", padding=12)
-        config_frame.pack(fill=tk.X, pady=(10, 16))
+        heading = QtWidgets.QLabel("Tracking configuration")
+        heading_font = heading.font()
+        heading_font.setPointSize(14)
+        heading_font.setBold(True)
+        heading.setFont(heading_font)
+        layout.addWidget(heading)
 
-        self.tracking_vars = {
-            "sigma_hp": tk.StringVar(value=str(self.tracker.config.sigma_hp)),
-            "sigma_smooth": tk.StringVar(value=str(self.tracker.config.sigma_smooth)),
-            "bright_percentile": tk.StringVar(value=str(self.tracker.config.bright_percentile)),
-            "resp_min": tk.StringVar(value=str(self.tracker.config.resp_min)),
-            "max_shift": tk.StringVar(value=str(self.tracker.config.max_shift_per_frame_px)),
-            "bg_alpha": tk.StringVar(value=str(self.tracker.config.bg_ema_alpha)),
-            "subtract_bg": tk.BooleanVar(value=self.tracker.config.subtract_bg_ema),
+        config_box = QtWidgets.QGroupBox("Phase correlation preprocessing")
+        config_layout = QtWidgets.QGridLayout(config_box)
+
+        self.tracking_inputs = {
+            "sigma_hp": QtWidgets.QLineEdit(str(self.tracker.config.sigma_hp)),
+            "sigma_smooth": QtWidgets.QLineEdit(str(self.tracker.config.sigma_smooth)),
+            "bright_percentile": QtWidgets.QLineEdit(str(self.tracker.config.bright_percentile)),
+            "resp_min": QtWidgets.QLineEdit(str(self.tracker.config.resp_min)),
+            "max_shift": QtWidgets.QLineEdit(str(self.tracker.config.max_shift_per_frame_px)),
+            "bg_alpha": QtWidgets.QLineEdit(str(self.tracker.config.bg_ema_alpha)),
         }
 
-        self._add_form_row(config_frame, "σ high-pass", self.tracking_vars["sigma_hp"], 0)
-        self._add_form_row(config_frame, "σ smooth", self.tracking_vars["sigma_smooth"], 1)
-        self._add_form_row(config_frame, "Bright %", self.tracking_vars["bright_percentile"], 2)
-        self._add_form_row(config_frame, "Resp min", self.tracking_vars["resp_min"], 3)
-        self._add_form_row(config_frame, "Max shift/frame", self.tracking_vars["max_shift"], 4)
-        self._add_form_row(config_frame, "BG EMA α", self.tracking_vars["bg_alpha"], 5)
+        self._add_form_row(config_layout, "σ high-pass", self.tracking_inputs["sigma_hp"], 0)
+        self._add_form_row(config_layout, "σ smooth", self.tracking_inputs["sigma_smooth"], 1)
+        self._add_form_row(config_layout, "Bright %", self.tracking_inputs["bright_percentile"], 2)
+        self._add_form_row(config_layout, "Resp min", self.tracking_inputs["resp_min"], 3)
+        self._add_form_row(config_layout, "Max shift/frame", self.tracking_inputs["max_shift"], 4)
+        self._add_form_row(config_layout, "BG EMA α", self.tracking_inputs["bg_alpha"], 5)
 
-        ttk.Checkbutton(
-            config_frame,
-            text="Subtract background EMA",
-            variable=self.tracking_vars["subtract_bg"],
-        ).grid(row=0, column=2, sticky="w", padx=10)
+        self.subtract_bg_checkbox = QtWidgets.QCheckBox("Subtract background EMA")
+        self.subtract_bg_checkbox.setChecked(self.tracker.config.subtract_bg_ema)
+        config_layout.addWidget(self.subtract_bg_checkbox, 0, 2, 1, 1)
 
-        ttk.Button(frame, text="Apply tracking settings", command=self.apply_tracking).pack(
-            anchor="w", pady=(0, 16)
-        )
+        layout.addWidget(config_box)
 
-        status_frame = ttk.LabelFrame(frame, text="Tracking telemetry", padding=12)
-        status_frame.pack(fill=tk.X)
-        self.track_detail_var = tk.StringVar(value="Waiting for capture…")
-        ttk.Label(status_frame, textvariable=self.track_detail_var).pack(anchor="w")
+        apply_button = QtWidgets.QPushButton("Apply tracking settings")
+        apply_button.clicked.connect(self.apply_tracking)
+        layout.addWidget(apply_button, alignment=QtCore.Qt.AlignLeft)
+
+        status_box = QtWidgets.QGroupBox("Tracking telemetry")
+        status_layout = QtWidgets.QVBoxLayout(status_box)
+        self.track_detail_label = QtWidgets.QLabel("Waiting for capture…")
+        status_layout.addWidget(self.track_detail_label)
+        layout.addWidget(status_box)
+        layout.addStretch()
 
     def _build_stacking_tab(self) -> None:
-        frame = ttk.Frame(self.tab_stacking, padding=20)
-        frame.pack(fill=tk.BOTH, expand=True)
+        layout = QtWidgets.QVBoxLayout(self.tab_stacking)
+        layout.setContentsMargins(20, 20, 20, 20)
 
-        ttk.Label(frame, text="Stacking configuration", font=("SF Pro Text", 14, "bold")).pack(anchor="w")
+        heading = QtWidgets.QLabel("Stacking configuration")
+        heading_font = heading.font()
+        heading_font.setPointSize(14)
+        heading_font.setBold(True)
+        heading.setFont(heading_font)
+        layout.addWidget(heading)
 
-        config_frame = ttk.LabelFrame(frame, text="Noise-aware stacking", padding=12)
-        config_frame.pack(fill=tk.X, pady=(10, 16))
+        config_box = QtWidgets.QGroupBox("Noise-aware stacking")
+        config_layout = QtWidgets.QGridLayout(config_box)
 
-        self.stacking_vars = {
-            "sigma_bg": tk.StringVar(value=str(self.stacker.config.sigma_bg)),
-            "sigma_floor": tk.StringVar(value=str(self.stacker.config.sigma_floor_p)),
-            "z_clip": tk.StringVar(value=str(self.stacker.config.z_clip)),
-            "peak_p": tk.StringVar(value=str(self.stacker.config.peak_p)),
-            "peak_blur": tk.StringVar(value=str(self.stacker.config.peak_blur)),
-            "resp_min": tk.StringVar(value=str(self.stacker.config.resp_min)),
-            "max_rad": tk.StringVar(value=str(self.stacker.config.max_rad)),
-            "hot_z": tk.StringVar(value=str(self.stacker.config.hot_z)),
-            "hot_max": tk.StringVar(value=str(self.stacker.config.hot_max)),
+        self.stacking_inputs = {
+            "sigma_bg": QtWidgets.QLineEdit(str(self.stacker.config.sigma_bg)),
+            "sigma_floor": QtWidgets.QLineEdit(str(self.stacker.config.sigma_floor_p)),
+            "z_clip": QtWidgets.QLineEdit(str(self.stacker.config.z_clip)),
+            "peak_p": QtWidgets.QLineEdit(str(self.stacker.config.peak_p)),
+            "peak_blur": QtWidgets.QLineEdit(str(self.stacker.config.peak_blur)),
+            "resp_min": QtWidgets.QLineEdit(str(self.stacker.config.resp_min)),
+            "max_rad": QtWidgets.QLineEdit(str(self.stacker.config.max_rad)),
+            "hot_z": QtWidgets.QLineEdit(str(self.stacker.config.hot_z)),
+            "hot_max": QtWidgets.QLineEdit(str(self.stacker.config.hot_max)),
         }
 
-        self._add_form_row(config_frame, "σ background", self.stacking_vars["sigma_bg"], 0)
-        self._add_form_row(config_frame, "Sigma floor %", self.stacking_vars["sigma_floor"], 1)
-        self._add_form_row(config_frame, "Z clip", self.stacking_vars["z_clip"], 2)
-        self._add_form_row(config_frame, "Peak %", self.stacking_vars["peak_p"], 3)
-        self._add_form_row(config_frame, "Peak blur", self.stacking_vars["peak_blur"], 4)
-        self._add_form_row(config_frame, "Resp min", self.stacking_vars["resp_min"], 5)
-        self._add_form_row(config_frame, "Max radius", self.stacking_vars["max_rad"], 6)
-        self._add_form_row(config_frame, "Hot-pixel Z", self.stacking_vars["hot_z"], 7)
-        self._add_form_row(config_frame, "Hot-pixel max", self.stacking_vars["hot_max"], 8)
+        self._add_form_row(config_layout, "σ background", self.stacking_inputs["sigma_bg"], 0)
+        self._add_form_row(config_layout, "Sigma floor %", self.stacking_inputs["sigma_floor"], 1)
+        self._add_form_row(config_layout, "Z clip", self.stacking_inputs["z_clip"], 2)
+        self._add_form_row(config_layout, "Peak %", self.stacking_inputs["peak_p"], 3)
+        self._add_form_row(config_layout, "Peak blur", self.stacking_inputs["peak_blur"], 4)
+        self._add_form_row(config_layout, "Resp min", self.stacking_inputs["resp_min"], 5)
+        self._add_form_row(config_layout, "Max radius", self.stacking_inputs["max_rad"], 6)
+        self._add_form_row(config_layout, "Hot-pixel Z", self.stacking_inputs["hot_z"], 7)
+        self._add_form_row(config_layout, "Hot-pixel max", self.stacking_inputs["hot_max"], 8)
 
-        ttk.Button(frame, text="Apply stacking settings", command=self.apply_stacking).pack(
-            anchor="w", pady=(0, 16)
-        )
+        layout.addWidget(config_box)
 
-        status_frame = ttk.LabelFrame(frame, text="Stack status", padding=12)
-        status_frame.pack(fill=tk.X)
-        self.stack_detail_var = tk.StringVar(value="Waiting for capture…")
-        ttk.Label(status_frame, textvariable=self.stack_detail_var).pack(anchor="w")
+        apply_button = QtWidgets.QPushButton("Apply stacking settings")
+        apply_button.clicked.connect(self.apply_stacking)
+        layout.addWidget(apply_button, alignment=QtCore.Qt.AlignLeft)
 
-        ttk.Button(frame, text="Save stacked image", command=self.save_stack).pack(anchor="w", pady=(12, 0))
+        status_box = QtWidgets.QGroupBox("Stack status")
+        status_layout = QtWidgets.QVBoxLayout(status_box)
+        self.stack_detail_label = QtWidgets.QLabel("Waiting for capture…")
+        status_layout.addWidget(self.stack_detail_label)
+        layout.addWidget(status_box)
+
+        save_button = QtWidgets.QPushButton("Save stacked image")
+        save_button.clicked.connect(self.save_stack)
+        layout.addWidget(save_button, alignment=QtCore.Qt.AlignLeft)
+        layout.addStretch()
 
     def _build_plate_tab(self) -> None:
-        frame = ttk.Frame(self.tab_solve, padding=20)
-        frame.pack(fill=tk.BOTH, expand=True)
+        layout = QtWidgets.QVBoxLayout(self.tab_solve)
+        layout.setContentsMargins(20, 20, 20, 20)
 
-        ttk.Label(frame, text="Plate solving", font=("SF Pro Text", 14, "bold")).pack(anchor="w")
+        heading = QtWidgets.QLabel("Plate solving")
+        heading_font = heading.font()
+        heading_font.setPointSize(14)
+        heading_font.setBold(True)
+        heading.setFont(heading_font)
+        layout.addWidget(heading)
 
-        settings_frame = ttk.LabelFrame(frame, text="Solve settings", padding=12)
-        settings_frame.pack(fill=tk.X, pady=(10, 16))
+        settings_box = QtWidgets.QGroupBox("Solve settings")
+        settings_layout = QtWidgets.QGridLayout(settings_box)
 
-        self.solve_vars = {
-            "target": tk.StringVar(value="M42"),
-            "radius_deg": tk.StringVar(value="1.0"),
-            "gmax": tk.StringVar(value="12.0"),
-            "pixel_um": tk.StringVar(value="2.9"),
-            "focal_mm": tk.StringVar(value="400.0"),
-            "max_gaia": tk.StringVar(value="8000"),
+        self.solve_inputs = {
+            "target": QtWidgets.QLineEdit("M42"),
+            "radius_deg": QtWidgets.QLineEdit("1.0"),
+            "gmax": QtWidgets.QLineEdit("12.0"),
+            "pixel_um": QtWidgets.QLineEdit("2.9"),
+            "focal_mm": QtWidgets.QLineEdit("400.0"),
+            "max_gaia": QtWidgets.QLineEdit("8000"),
         }
 
-        self._add_form_row(settings_frame, "Target (name/coord)", self.solve_vars["target"], 0, width=28)
-        self._add_form_row(settings_frame, "Search radius (deg)", self.solve_vars["radius_deg"], 1)
-        self._add_form_row(settings_frame, "G max", self.solve_vars["gmax"], 2)
-        self._add_form_row(settings_frame, "Pixel size (µm)", self.solve_vars["pixel_um"], 3)
-        self._add_form_row(settings_frame, "Focal length (mm)", self.solve_vars["focal_mm"], 4)
-        self._add_form_row(settings_frame, "Max Gaia sources", self.solve_vars["max_gaia"], 5)
+        self._add_form_row(settings_layout, "Target (name/coord)", self.solve_inputs["target"], 0, width=28)
+        self._add_form_row(settings_layout, "Search radius (deg)", self.solve_inputs["radius_deg"], 1)
+        self._add_form_row(settings_layout, "G max", self.solve_inputs["gmax"], 2)
+        self._add_form_row(settings_layout, "Pixel size (µm)", self.solve_inputs["pixel_um"], 3)
+        self._add_form_row(settings_layout, "Focal length (mm)", self.solve_inputs["focal_mm"], 4)
+        self._add_form_row(settings_layout, "Max Gaia sources", self.solve_inputs["max_gaia"], 5)
 
-        btn_frame = ttk.Frame(frame)
-        btn_frame.pack(fill=tk.X, pady=(0, 12))
-        self.solve_button = ttk.Button(btn_frame, text="Solve from current stack", command=self.start_plate_solve)
-        self.solve_button.pack(side=tk.LEFT)
+        layout.addWidget(settings_box)
 
-        status_frame = ttk.LabelFrame(frame, text="Solution summary", padding=12)
-        status_frame.pack(fill=tk.X)
-        self.solve_detail_var = tk.StringVar(value="No solution yet.")
-        ttk.Label(status_frame, textvariable=self.solve_detail_var).pack(anchor="w")
+        self.solve_button = QtWidgets.QPushButton("Solve from current stack")
+        self.solve_button.clicked.connect(self.start_plate_solve)
+        layout.addWidget(self.solve_button, alignment=QtCore.Qt.AlignLeft)
+
+        status_box = QtWidgets.QGroupBox("Solution summary")
+        status_layout = QtWidgets.QVBoxLayout(status_box)
+        self.solve_detail_label = QtWidgets.QLabel("No solution yet.")
+        status_layout.addWidget(self.solve_detail_label)
+        layout.addWidget(status_box)
+        layout.addStretch()
 
     def _build_goto_tab(self) -> None:
-        frame = ttk.Frame(self.tab_goto, padding=20)
-        frame.pack(fill=tk.BOTH, expand=True)
+        layout = QtWidgets.QVBoxLayout(self.tab_goto)
+        layout.setContentsMargins(20, 20, 20, 20)
 
-        ttk.Label(frame, text="GoTo helper", font=("SF Pro Text", 14, "bold")).pack(anchor="w")
+        heading = QtWidgets.QLabel("GoTo helper")
+        heading_font = heading.font()
+        heading_font.setPointSize(14)
+        heading_font.setBold(True)
+        heading.setFont(heading_font)
+        layout.addWidget(heading)
 
-        goto_frame = ttk.LabelFrame(frame, text="Target offsets", padding=12)
-        goto_frame.pack(fill=tk.X, pady=(10, 16))
+        goto_box = QtWidgets.QGroupBox("Target offsets")
+        goto_layout = QtWidgets.QGridLayout(goto_box)
 
-        self.goto_vars = {
-            "target_ra": tk.StringVar(value="83.8221"),
-            "target_dec": tk.StringVar(value="-5.3911"),
+        self.goto_inputs = {
+            "target_ra": QtWidgets.QLineEdit("83.8221"),
+            "target_dec": QtWidgets.QLineEdit("-5.3911"),
         }
 
-        self._add_form_row(goto_frame, "Target RA (deg)", self.goto_vars["target_ra"], 0)
-        self._add_form_row(goto_frame, "Target Dec (deg)", self.goto_vars["target_dec"], 1)
+        self._add_form_row(goto_layout, "Target RA (deg)", self.goto_inputs["target_ra"], 0)
+        self._add_form_row(goto_layout, "Target Dec (deg)", self.goto_inputs["target_dec"], 1)
 
-        ttk.Button(frame, text="Compute offset", command=self.compute_goto_offset).pack(anchor="w")
+        layout.addWidget(goto_box)
 
-        status_frame = ttk.LabelFrame(frame, text="GoTo result", padding=12)
-        status_frame.pack(fill=tk.X, pady=(12, 0))
-        self.goto_detail_var = tk.StringVar(value="Need a plate solution to compute offsets.")
-        ttk.Label(status_frame, textvariable=self.goto_detail_var).pack(anchor="w")
+        compute_button = QtWidgets.QPushButton("Compute offset")
+        compute_button.clicked.connect(self.compute_goto_offset)
+        layout.addWidget(compute_button, alignment=QtCore.Qt.AlignLeft)
+
+        status_box = QtWidgets.QGroupBox("GoTo result")
+        status_layout = QtWidgets.QVBoxLayout(status_box)
+        self.goto_detail_label = QtWidgets.QLabel("Need a plate solution to compute offsets.")
+        status_layout.addWidget(self.goto_detail_label)
+        layout.addWidget(status_box)
+        layout.addStretch()
 
     def _build_logs_tab(self) -> None:
-        frame = ttk.Frame(self.tab_logs, padding=10)
-        frame.pack(fill=tk.BOTH, expand=True)
+        layout = QtWidgets.QVBoxLayout(self.tab_logs)
+        layout.setContentsMargins(10, 10, 10, 10)
 
-        self.log_text = tk.Text(frame, height=12, wrap=tk.WORD)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
-        self.log_text.configure(state=tk.DISABLED)
+        self.log_text = QtWidgets.QTextEdit()
+        self.log_text.setReadOnly(True)
+        layout.addWidget(self.log_text)
 
     def _add_form_row(
         self,
-        parent: ttk.Frame,
+        layout: QtWidgets.QGridLayout,
         label: str,
-        variable: tk.Variable,
+        widget: QtWidgets.QLineEdit,
         row: int,
         width: int = 12,
     ) -> None:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
-        entry = ttk.Entry(parent, textvariable=variable, width=width)
-        entry.grid(row=row, column=1, sticky="w", pady=4)
+        layout.addWidget(QtWidgets.QLabel(label), row, 0)
+        widget.setMaximumWidth(width * 10)
+        layout.addWidget(widget, row, 1)
 
     def _safe_float(self, value: str, default: float) -> float:
         try:
@@ -311,20 +371,17 @@ class AstroStackApp:
                 msg = self.msg_queue.get_nowait()
             except queue.Empty:
                 break
-            self.log_text.configure(state=tk.NORMAL)
-            self.log_text.insert(tk.END, msg + "\n")
-            self.log_text.configure(state=tk.DISABLED)
-            self.log_text.see(tk.END)
+            self.log_text.append(msg)
 
         while True:
             try:
                 result, error = self.solve_queue.get_nowait()
             except queue.Empty:
                 break
-            self.solve_button.configure(state=tk.NORMAL)
+            self.solve_button.setEnabled(True)
             if error:
-                self.solve_status_var.set("Solve failed")
-                self.solve_detail_var.set(error)
+                self.solve_status_label.setText("Solve failed")
+                self.solve_detail_label.setText(error)
                 self.log(error)
                 continue
             if result is not None:
@@ -337,13 +394,11 @@ class AstroStackApp:
             except queue.Empty:
                 break
             if "track_status" in status:
-                self.track_status_var.set(status["track_status"])
-                self.track_detail_var.set(status["track_detail"])
+                self.track_status_label.setText(status["track_status"])
+                self.track_detail_label.setText(status["track_detail"])
             if "stack_status" in status:
-                self.stack_status_var.set(status["stack_status"])
-                self.stack_detail_var.set(status["stack_detail"])
-
-        self.root.after(200, self._poll_messages)
+                self.stack_status_label.setText(status["stack_status"])
+                self.stack_detail_label.setText(status["stack_detail"])
 
     def log(self, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
@@ -351,32 +406,38 @@ class AstroStackApp:
 
     def apply_tracking(self) -> None:
         cfg = TrackingConfig(
-            sigma_hp=self._safe_float(self.tracking_vars["sigma_hp"].get(), self.tracker.config.sigma_hp),
-            sigma_smooth=self._safe_float(self.tracking_vars["sigma_smooth"].get(), self.tracker.config.sigma_smooth),
+            sigma_hp=self._safe_float(self.tracking_inputs["sigma_hp"].text(), self.tracker.config.sigma_hp),
+            sigma_smooth=self._safe_float(
+                self.tracking_inputs["sigma_smooth"].text(), self.tracker.config.sigma_smooth
+            ),
             bright_percentile=self._safe_float(
-                self.tracking_vars["bright_percentile"].get(), self.tracker.config.bright_percentile
+                self.tracking_inputs["bright_percentile"].text(), self.tracker.config.bright_percentile
             ),
-            resp_min=self._safe_float(self.tracking_vars["resp_min"].get(), self.tracker.config.resp_min),
+            resp_min=self._safe_float(self.tracking_inputs["resp_min"].text(), self.tracker.config.resp_min),
             max_shift_per_frame_px=self._safe_float(
-                self.tracking_vars["max_shift"].get(), self.tracker.config.max_shift_per_frame_px
+                self.tracking_inputs["max_shift"].text(), self.tracker.config.max_shift_per_frame_px
             ),
-            bg_ema_alpha=self._safe_float(self.tracking_vars["bg_alpha"].get(), self.tracker.config.bg_ema_alpha),
-            subtract_bg_ema=bool(self.tracking_vars["subtract_bg"].get()),
+            bg_ema_alpha=self._safe_float(
+                self.tracking_inputs["bg_alpha"].text(), self.tracker.config.bg_ema_alpha
+            ),
+            subtract_bg_ema=self.subtract_bg_checkbox.isChecked(),
         )
         self.tracker.config = cfg
         self.log("Tracking settings updated.")
 
     def apply_stacking(self) -> None:
         cfg = StackingConfig(
-            sigma_bg=self._safe_float(self.stacking_vars["sigma_bg"].get(), self.stacker.config.sigma_bg),
-            sigma_floor_p=self._safe_float(self.stacking_vars["sigma_floor"].get(), self.stacker.config.sigma_floor_p),
-            z_clip=self._safe_float(self.stacking_vars["z_clip"].get(), self.stacker.config.z_clip),
-            peak_p=self._safe_float(self.stacking_vars["peak_p"].get(), self.stacker.config.peak_p),
-            peak_blur=self._safe_float(self.stacking_vars["peak_blur"].get(), self.stacker.config.peak_blur),
-            resp_min=self._safe_float(self.stacking_vars["resp_min"].get(), self.stacker.config.resp_min),
-            max_rad=self._safe_float(self.stacking_vars["max_rad"].get(), self.stacker.config.max_rad),
-            hot_z=self._safe_float(self.stacking_vars["hot_z"].get(), self.stacker.config.hot_z),
-            hot_max=self._safe_int(self.stacking_vars["hot_max"].get(), self.stacker.config.hot_max),
+            sigma_bg=self._safe_float(self.stacking_inputs["sigma_bg"].text(), self.stacker.config.sigma_bg),
+            sigma_floor_p=self._safe_float(
+                self.stacking_inputs["sigma_floor"].text(), self.stacker.config.sigma_floor_p
+            ),
+            z_clip=self._safe_float(self.stacking_inputs["z_clip"].text(), self.stacker.config.z_clip),
+            peak_p=self._safe_float(self.stacking_inputs["peak_p"].text(), self.stacker.config.peak_p),
+            peak_blur=self._safe_float(self.stacking_inputs["peak_blur"].text(), self.stacker.config.peak_blur),
+            resp_min=self._safe_float(self.stacking_inputs["resp_min"].text(), self.stacker.config.resp_min),
+            max_rad=self._safe_float(self.stacking_inputs["max_rad"].text(), self.stacker.config.max_rad),
+            hot_z=self._safe_float(self.stacking_inputs["hot_z"].text(), self.stacker.config.hot_z),
+            hot_max=self._safe_int(self.stacking_inputs["hot_max"].text(), self.stacker.config.hot_max),
         )
         self.stacker.config = cfg
         self.log("Stacking settings updated.")
@@ -388,10 +449,10 @@ class AstroStackApp:
         self.stop_event.clear()
         self.stacker.start(height=self.simulator.config.height, width=self.simulator.config.width)
         self.tracker.reset()
-        self.btn_start.configure(state=tk.DISABLED)
-        self.btn_stop.configure(state=tk.NORMAL)
-        self.btn_reset.configure(state=tk.NORMAL)
-        self.capture_status_var.set("Running (simulation)")
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.btn_reset.setEnabled(True)
+        self.capture_status_label.setText("Running (simulation)")
         self.log("Capture started (simulation).")
         self.worker = threading.Thread(target=self._run_capture_loop, daemon=True)
         self.worker.start()
@@ -401,17 +462,17 @@ class AstroStackApp:
             return
         self.stop_event.set()
         self.state.running = False
-        self.btn_start.configure(state=tk.NORMAL)
-        self.btn_stop.configure(state=tk.DISABLED)
-        self.capture_status_var.set("Stopped")
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.capture_status_label.setText("Stopped")
         self.log("Capture stopped.")
 
     def reset_stack(self) -> None:
         if self.simulator:
             self.stacker.start(height=self.simulator.config.height, width=self.simulator.config.width)
         self.state.last_stack = None
-        self.stack_status_var.set("Stack reset")
-        self.stack_detail_var.set("Stack reset.")
+        self.stack_status_label.setText("Stack reset")
+        self.stack_detail_label.setText("Stack reset.")
         self.log("Stack reset.")
 
     def _run_capture_loop(self) -> None:
@@ -456,29 +517,31 @@ class AstroStackApp:
     def save_stack(self) -> None:
         stack = self.state.last_stack
         if stack is None:
-            messagebox.showwarning("AstroStack", "No stack available yet.")
+            QtWidgets.QMessageBox.warning(self, "AstroStack", "No stack available yet.")
             return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".png",
-            filetypes=[("PNG", "*.png"), ("TIFF", "*.tif"), ("All files", "*.*")],
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save stacked image",
+            "",
+            "PNG (*.png);;TIFF (*.tif);;All files (*.*)",
         )
         if not path:
             return
         try:
             self.stacker.save_png(path)
         except Exception as exc:
-            messagebox.showerror("AstroStack", f"Failed to save: {exc}")
+            QtWidgets.QMessageBox.critical(self, "AstroStack", f"Failed to save: {exc}")
             return
         self.log(f"Stack saved to {path}.")
 
     def _collect_plate_settings(self) -> PlateSolveSettings:
         return PlateSolveSettings(
-            target=self.solve_vars["target"].get().strip() or "M42",
-            radius_deg=self._safe_float(self.solve_vars["radius_deg"].get(), 1.0),
-            gmax=self._safe_float(self.solve_vars["gmax"].get(), 12.0),
-            pixel_size_um=self._safe_float(self.solve_vars["pixel_um"].get(), 2.9),
-            focal_length_mm=self._safe_float(self.solve_vars["focal_mm"].get(), 400.0),
-            max_gaia_sources=self._safe_int(self.solve_vars["max_gaia"].get(), 8000),
+            target=self.solve_inputs["target"].text().strip() or "M42",
+            radius_deg=self._safe_float(self.solve_inputs["radius_deg"].text(), 1.0),
+            gmax=self._safe_float(self.solve_inputs["gmax"].text(), 12.0),
+            pixel_size_um=self._safe_float(self.solve_inputs["pixel_um"].text(), 2.9),
+            focal_length_mm=self._safe_float(self.solve_inputs["focal_mm"].text(), 400.0),
+            max_gaia_sources=self._safe_int(self.solve_inputs["max_gaia"].text(), 8000),
         )
 
     def start_plate_solve(self) -> None:
@@ -486,11 +549,11 @@ class AstroStackApp:
             self.log("Plate solving already running.")
             return
         if self.state.last_stack is None:
-            messagebox.showwarning("AstroStack", "No stacked image available yet.")
+            QtWidgets.QMessageBox.warning(self, "AstroStack", "No stacked image available yet.")
             return
         settings = self._collect_plate_settings()
-        self.solve_button.configure(state=tk.DISABLED)
-        self.solve_status_var.set("Solving…")
+        self.solve_button.setEnabled(False)
+        self.solve_status_label.setText("Solving…")
         self.log("Plate solve started.")
         self.solve_worker = threading.Thread(
             target=self._run_plate_solve,
@@ -510,8 +573,8 @@ class AstroStackApp:
     def _update_plate_status(self, result: PlateSolveResult) -> None:
         stars = len(result.stars)
         if not result.solution:
-            self.solve_detail_var.set(f"Detected {stars} stars. Not enough matches for a solution.")
-            self.solve_status_var.set("Solve incomplete")
+            self.solve_detail_label.setText(f"Detected {stars} stars. Not enough matches for a solution.")
+            self.solve_status_label.setText("Solve incomplete")
             self.log("Plate solve incomplete (not enough stars or matches).")
             return
         metrics = result.solution.get("metrics", {})
@@ -522,30 +585,36 @@ class AstroStackApp:
         else:
             center_text = "Center unavailable"
         err_text = f"err_med={err:.3f}\"" if err is not None else "err_med=--"
-        self.solve_detail_var.set(f"Stars: {stars} | {err_text} | {center_text}")
-        self.solve_status_var.set("Solved")
+        self.solve_detail_label.setText(f"Stars: {stars} | {err_text} | {center_text}")
+        self.solve_status_label.setText("Solved")
         self.log("Plate solve complete.")
 
     def compute_goto_offset(self) -> None:
         result = self.state.last_plate_result
         if result is None or result.center_radec is None:
-            messagebox.showwarning("AstroStack", "No plate solution available.")
+            QtWidgets.QMessageBox.warning(self, "AstroStack", "No plate solution available.")
             return
-        target_ra = self._safe_float(self.goto_vars["target_ra"].get(), result.center_radec[0])
-        target_dec = self._safe_float(self.goto_vars["target_dec"].get(), result.center_radec[1])
+        target_ra = self._safe_float(self.goto_inputs["target_ra"].text(), result.center_radec[0])
+        target_dec = self._safe_float(self.goto_inputs["target_dec"].text(), result.center_radec[1])
         solved_ra, solved_dec = result.center_radec
         delta_ra = (target_ra - solved_ra + 540.0) % 360.0 - 180.0
         delta_dec = target_dec - solved_dec
-        self.goto_detail_var.set(
+        self.goto_detail_label.setText(
             f"ΔRA={delta_ra:+.3f}° ({delta_ra * 60:+.2f}′) | ΔDec={delta_dec:+.3f}° ({delta_dec * 60:+.2f}′)"
         )
         self.log("GoTo offset computed.")
 
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if self.state.running:
+            self.stop_event.set()
+        event.accept()
+
 
 def main() -> None:
-    root = tk.Tk()
-    app = AstroStackApp(root)
-    root.mainloop()
+    app = QtWidgets.QApplication(sys.argv)
+    window = AstroStackApp()
+    window.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

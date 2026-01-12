@@ -25,7 +25,7 @@ import numpy as np
 import cv2
 from scipy.ndimage import gaussian_filter, binary_dilation, generate_binary_structure
 
-from ..plate_solve_pipeline import run_pipeline
+from ..plate_solve.pipeline import run_pipeline
 from ..stacking import StackingConfig, StackingEngine
 from . import pyPOACamera
 

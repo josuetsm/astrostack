@@ -5,7 +5,7 @@ from typing import Any, Iterable, Tuple
 
 import numpy as np
 
-from .plate_solve_pipeline import run_pipeline
+from .plate_solve.pipeline import run_pipeline
 from .preprocessing import StretchConfig, stretch_to_u8
 from .star_detection import StarDetectionConfig, detect_stars
 

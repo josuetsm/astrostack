@@ -1,11 +1,8 @@
-# -*- coding: utf-8 -*-
-"""Compatibilidad: reexporta el pipeline de plate solving desde astrostack.plate_solve."""
+"""Subpaquete de plate solving (Gaia + SIMBAD)."""
 
-from __future__ import annotations
-
-from .plate_solve.pipeline import run_pipeline, query_gaia_healpix_df
-from .plate_solve.simbad_cache import resolve_bright_star_names_simbad, set_name_cache_dir
-from .plate_solve.geometry import (
+from .pipeline import run_pipeline, query_gaia_healpix_df
+from .simbad_cache import resolve_bright_star_names_simbad, set_name_cache_dir
+from .geometry import (
     radec_to_unitvec,
     chord_radius_from_deg,
     compute_scale_arcsec_per_px,
@@ -13,7 +10,7 @@ from .plate_solve.geometry import (
     mag_to_size,
     unwrap_ra_for_plot,
 )
-from .plate_solve.matching import (
+from .matching import (
     GaiaIndex,
     build_gaia_index,
     candidate_pairs_by_annulus,

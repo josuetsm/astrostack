@@ -35,6 +35,7 @@ class StackingState:
     stack_sum: Optional[np.ndarray] = None
     stack_w: Optional[np.ndarray] = None
     ones: Optional[np.ndarray] = None
+    frames_total: int = 0
     frames_used: int = 0
     last_dx: float = 0.0
     last_dy: float = 0.0
@@ -69,6 +70,7 @@ class StackingEngine:
         cfg = self.config
         state = self.state
 
+        state.frames_total += 1
         frame_fix = remove_hot_pixels(frame_u16, hot_z=cfg.hot_z, hot_max=cfg.hot_max)
 
         z = local_zscore_u16(

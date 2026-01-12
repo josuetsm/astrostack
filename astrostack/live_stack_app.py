@@ -42,13 +42,7 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from astrostack import pyPOACamera
-from astrostack.preprocessing import (
-    local_zscore_u16,
-    make_sparse_reg,
-    pyramid_phasecorr_delta,
-    remove_hot_pixels,
-    warp_translate,
-)
+from astrostack.stacking import StackingConfig, StackingEngine
 from astrostack.plate_solve_pipeline import run_pipeline
 
 cv2.setUseOptimized(True)
@@ -551,46 +545,17 @@ def demosaic_raw8(raw: np.ndarray, pattern: str, want_color: bool, hq: bool) -> 
 # =========================
 # Live stacker
 # =========================
-@dataclass
-class StackConfig:
-    roi: int = 0
-    sigma_bg: float = 35.0
-    sigma_floor_p: float = 10.0
-    z_clip: float = 6.0
-    peak_p: float = 99.75
-    peak_blur: float = 1.0
-    resp_min: float = 0.05
-    max_rad: float = 400.0
-    hot_z: float = 12.0
-    hot_max: int = 200
-
-
 class LiveStacker:
-    def __init__(self, cfg: StackConfig):
-        self.cfg = cfg
+    def __init__(self, config: StackingConfig):
+        self.engine = StackingEngine(config)
+        self.config = self.engine.config
         self.reset()
 
-    def reset(self):
+    def reset(self) -> None:
         self.state = "PAUSED"
         self.paused = True
-        self.ref_reg: Optional[np.ndarray] = None
-        self.acc_sum: Optional[np.ndarray] = None
-        self.acc_w: Optional[np.ndarray] = None
-        self.ones: Optional[np.ndarray] = None
-        self.frame_shape: Optional[Tuple[int, int]] = None
-
         self.frames_total = 0
-        self.frames_used = 0
-        self.last_dxdy = (0.0, 0.0)
-        self.last_resp = 0.0
-        self.last_used = 0
-
-    def _ensure_stack(self, height: int, width: int) -> None:
-        if self.acc_sum is None or self.acc_w is None or self.ones is None:
-            self.acc_sum = np.zeros((height, width), dtype=np.float32)
-            self.acc_w = np.zeros((height, width), dtype=np.float32)
-            self.ones = np.ones((height, width), dtype=np.float32)
-            self.frame_shape = (height, width)
+        self.engine.reset()
 
     def process(self, frame_u16: np.ndarray) -> None:
         frame_u16 = frame_u16.astype(np.uint16, copy=False)
@@ -600,60 +565,32 @@ class LiveStacker:
             return
         self.state = "ACTIVE"
 
-        cfg = self.cfg
+        if not self.engine.state.active:
+            self.engine.start(frame_u16.shape[0], frame_u16.shape[1])
 
-        frame_fix = remove_hot_pixels(frame_u16, hot_z=float(cfg.hot_z), hot_max=int(cfg.hot_max))
-        z = local_zscore_u16(
-            frame_fix,
-            sigma_bg=float(cfg.sigma_bg),
-            floor_p=float(cfg.sigma_floor_p),
-            z_clip=float(cfg.z_clip),
-        )
-        reg = make_sparse_reg(z, peak_p=float(cfg.peak_p), blur_sigma=float(cfg.peak_blur), hot_mask=None)
-
-        self._ensure_stack(frame_fix.shape[0], frame_fix.shape[1])
-        if self.acc_sum is None or self.acc_w is None or self.ones is None:
-            return
-
-        if self.ref_reg is None:
-            self.ref_reg = reg.astype(np.float32).copy()
-            dx = dy = 0.0
-            resp = 1.0
-            used = True
-            warped = frame_fix.astype(np.float32)
-            wmask = self.ones.copy()
-        else:
-            dx, dy, resp = pyramid_phasecorr_delta(
-                self.ref_reg.astype(np.float32),
-                reg.astype(np.float32),
-                levels=3,
-            )
-            rad = float(np.hypot(dx, dy))
-            used = True
-            if (resp < float(cfg.resp_min)) or (rad > float(cfg.max_rad)) or (not np.isfinite(rad)):
-                used = False
-                warped = None
-                wmask = None
-            else:
-                warped = warp_translate(frame_fix.astype(np.float32), dx, dy, is_mask=False)
-                wmask = warp_translate(self.ones, dx, dy, is_mask=True)
-
-        self.last_dxdy = (float(dx), float(dy))
-        self.last_resp = float(resp)
-        self.last_used = int(used)
-
-        if used and warped is not None and wmask is not None:
-            self.frames_used += 1
-            self.acc_sum += warped
-            self.acc_w += wmask
+        self.engine.step(frame_u16)
 
     def get_stack_u16(self) -> Optional[np.ndarray]:
-        if self.acc_sum is None or self.acc_w is None or not np.any(self.acc_w > 0):
+        stack = self.engine.stack_image()
+        if stack is None:
             return None
-        denom = np.maximum(self.acc_w, 1e-6)
-        img = self.acc_sum / denom
-        img = np.where(self.acc_w > 0, img, 0.0)
-        return np.clip(img, 0, 65535).astype(np.uint16)
+        return np.clip(stack, 0, 65535).astype(np.uint16)
+
+    @property
+    def frames_used(self) -> int:
+        return self.engine.state.frames_used
+
+    @property
+    def last_resp(self) -> float:
+        return self.engine.state.last_resp
+
+    @property
+    def last_used(self) -> int:
+        return self.engine.state.last_used
+
+    @property
+    def last_dxdy(self) -> Tuple[float, float]:
+        return (self.engine.state.last_dx, self.engine.state.last_dy)
 
     def overlay_lines(self) -> List[str]:
         dx, dy = self.last_dxdy
@@ -1419,7 +1356,7 @@ def main(outdir: str = "captures", roi: int = 0, binning: int = 1, solve_cfg: Op
     if solve_cfg is None:
         solve_cfg = SolveConfig()
 
-    cfg = StackConfig(roi=roi)
+    cfg = StackingConfig()
     stacker = LiveStacker(cfg)
     p = Params()
 

@@ -18,6 +18,7 @@ if str(PACKAGE_ROOT) not in sys.path:
 from astrostack.plate_solve_service import PlateSolveResult, PlateSolveSettings, solve_from_stack
 from astrostack.preprocessing import StretchConfig, stretch_to_u8
 from astrostack.simulations import StarFieldSimulator
+from astrostack.arduino import ArduinoController
 from astrostack.stacking import StackingConfig, StackingEngine
 from astrostack.tracking import TrackingConfig, TrackingEngine
 
@@ -45,6 +46,7 @@ class AstroStackApp(QtWidgets.QMainWindow):
         self.stacker = StackingEngine(StackingConfig())
         self.tracker = TrackingEngine(TrackingConfig())
         self.simulator = StarFieldSimulator()
+        self.arduino = ArduinoController()
         self.worker: Optional[threading.Thread] = None
         self.solve_worker: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
@@ -195,6 +197,30 @@ class AstroStackApp(QtWidgets.QMainWindow):
         config_layout.addWidget(self.subtract_bg_checkbox, 0, 2, 1, 1)
 
         layout.addWidget(config_box)
+
+        arduino_box = QtWidgets.QGroupBox("Arduino mount")
+        arduino_layout = QtWidgets.QGridLayout(arduino_box)
+
+        self.arduino_port_input = QtWidgets.QLineEdit(self.arduino.port)
+        self.arduino_baud_input = QtWidgets.QLineEdit(str(self.arduino.baud))
+        self.arduino_connect_button = QtWidgets.QPushButton("Connect")
+        self.arduino_connect_button.clicked.connect(self.toggle_arduino_connection)
+        self.arduino_enable_checkbox = QtWidgets.QCheckBox("Enable mount")
+        self.arduino_enable_checkbox.stateChanged.connect(self.toggle_arduino_enable)
+        self.arduino_stop_button = QtWidgets.QPushButton("Stop")
+        self.arduino_stop_button.clicked.connect(self.stop_arduino)
+        self.arduino_status_label = QtWidgets.QLabel("Not connected")
+
+        arduino_layout.addWidget(QtWidgets.QLabel("Port"), 0, 0)
+        arduino_layout.addWidget(self.arduino_port_input, 0, 1)
+        arduino_layout.addWidget(QtWidgets.QLabel("Baud"), 0, 2)
+        arduino_layout.addWidget(self.arduino_baud_input, 0, 3)
+        arduino_layout.addWidget(self.arduino_connect_button, 0, 4)
+        arduino_layout.addWidget(self.arduino_enable_checkbox, 1, 0, 1, 2)
+        arduino_layout.addWidget(self.arduino_stop_button, 1, 2, 1, 1)
+        arduino_layout.addWidget(self.arduino_status_label, 1, 3, 1, 2)
+
+        layout.addWidget(arduino_box)
 
         apply_button = QtWidgets.QPushButton("Apply tracking settings")
         apply_button.clicked.connect(self.apply_tracking)
@@ -430,6 +456,41 @@ class AstroStackApp(QtWidgets.QMainWindow):
         self.tracker.config = cfg
         self.log("Tracking settings updated.")
 
+    def toggle_arduino_connection(self) -> None:
+        if self.arduino.is_connected:
+            status = self.arduino.disconnect()
+            self.arduino_connect_button.setText("Connect")
+            self.arduino_enable_checkbox.setChecked(False)
+        else:
+            port = self.arduino_port_input.text().strip()
+            baud = self._safe_int(self.arduino_baud_input.text(), self.arduino.baud)
+            status = self.arduino.connect(port=port, baud=baud)
+            if status.connected:
+                self.arduino_connect_button.setText("Disconnect")
+        self.arduino_status_label.setText(status.message)
+        self.log(f"Arduino: {status.message}")
+
+    def toggle_arduino_enable(self) -> None:
+        if not self.arduino.is_connected:
+            self.arduino_enable_checkbox.setChecked(False)
+            self.arduino_status_label.setText("Connect first")
+            return
+        enabled = self.arduino_enable_checkbox.isChecked()
+        reply = self.arduino.enable(enabled)
+        state = "enabled" if enabled else "disabled"
+        message = f"Mount {state} ({reply or 'no reply'})"
+        self.arduino_status_label.setText(message)
+        self.log(f"Arduino: {message}")
+
+    def stop_arduino(self) -> None:
+        if not self.arduino.is_connected:
+            self.arduino_status_label.setText("Connect first")
+            return
+        reply = self.arduino.stop()
+        message = f"Stop sent ({reply or 'no reply'})"
+        self.arduino_status_label.setText(message)
+        self.log(f"Arduino: {message}")
+
     def apply_stacking(self) -> None:
         cfg = StackingConfig(
             sigma_bg=self._safe_float(self.stacking_inputs["sigma_bg"].text(), self.stacker.config.sigma_bg),
@@ -612,6 +673,8 @@ class AstroStackApp(QtWidgets.QMainWindow):
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         if self.state.running:
             self.stop_event.set()
+        if self.arduino.is_connected:
+            self.arduino.disconnect()
         event.accept()
 
 

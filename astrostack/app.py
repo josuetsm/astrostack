@@ -979,40 +979,6 @@ class AstroStackApp(QtWidgets.QMainWindow):
             f"GoTo completed: target AZ={az_deg:.2f}° ALT={alt_deg:.2f}° (ΔAZ={da:+.2f}°)."
         )
 
-    def _start_manual_move(self, axis: str, direction: str) -> None:
-        if self.manual_move_worker and self.manual_move_worker.is_alive():
-            self.log("Manual move already running.")
-            return
-        if not self.arduino.is_connected:
-            self.log("Manual move failed: Arduino not connected.")
-            return
-        if axis == "A":
-            steps = self._safe_int(self.manual_steps_az_input.text(), 200)
-            delay_us = self._safe_int(self.manual_delay_az_input.text(), 1500)
-        else:
-            steps = self._safe_int(self.manual_steps_alt_input.text(), 200)
-            delay_us = self._safe_int(self.manual_delay_alt_input.text(), 1500)
-        self.manual_move_worker = threading.Thread(
-            target=self._run_manual_move,
-            args=(axis, direction, steps, delay_us),
-            daemon=True,
-        )
-        self.manual_move_worker.start()
-
-    def _run_manual_move(self, axis: str, direction: str, steps: int, delay_us: int) -> None:
-        if steps <= 0:
-            self.log("Manual move skipped: steps must be positive.")
-            return
-        delay = int(max(200, min(5000, delay_us)))
-        self.arduino.rate(0.0, 0.0)
-        self.arduino.move(axis, direction, steps, delay)
-        delta = float(steps if direction == "FWD" else -steps)
-        if axis == "A":
-            self.mount.apply_move(delta, 0.0)
-        else:
-            self.mount.apply_move(0.0, delta)
-        self.log(f"Manual move {axis} {direction} steps={steps} delay={delay}us.")
-
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         if self.state.running:
             self.stop_event.set()

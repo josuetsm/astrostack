@@ -87,7 +87,59 @@ class AstroStackApp(QtWidgets.QMainWindow):
     def _build_ui(self) -> None:
         container = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(container)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        self.setStyleSheet(
+            """
+            QWidget {
+                font-size: 13px;
+            }
+            QGroupBox {
+                border: 1px solid #d0d7de;
+                border-radius: 10px;
+                margin-top: 14px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
+                font-weight: 600;
+            }
+            QPushButton {
+                background: #f6f8fa;
+                border: 1px solid #d0d7de;
+                border-radius: 8px;
+                padding: 6px 14px;
+            }
+            QPushButton[primary="true"] {
+                background: #0969da;
+                color: #ffffff;
+                border: 1px solid #0969da;
+            }
+            QPushButton:disabled {
+                background: #f0f0f0;
+                color: #9a9a9a;
+                border-color: #e0e0e0;
+            }
+            QTabWidget::pane {
+                border: 1px solid #d0d7de;
+                border-radius: 10px;
+                padding: 6px;
+            }
+            QTabBar::tab {
+                padding: 8px 16px;
+                margin-right: 4px;
+            }
+            QLabel[sectionTitle="true"] {
+                font-size: 16px;
+                font-weight: 600;
+            }
+            QLabel[muted="true"] {
+                color: #57606a;
+            }
+            """
+        )
 
         header = QtWidgets.QFrame()
         header_layout = QtWidgets.QVBoxLayout(header)
@@ -99,6 +151,7 @@ class AstroStackApp(QtWidgets.QMainWindow):
         title_font.setBold(True)
         title.setFont(title_font)
         subtitle = QtWidgets.QLabel("Tracking · Stacking · Plate Solving · GoTo")
+        subtitle.setProperty("muted", True)
         header_layout.addWidget(title)
         header_layout.addWidget(subtitle)
 
@@ -133,34 +186,38 @@ class AstroStackApp(QtWidgets.QMainWindow):
     def _build_overview_tab(self) -> None:
         layout = QtWidgets.QVBoxLayout(self.tab_overview)
         layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
 
-        status_box = QtWidgets.QGroupBox("Session status")
-        status_layout = QtWidgets.QGridLayout(status_box)
+        status_row = QtWidgets.QGridLayout()
+        status_row.setSpacing(12)
 
         self.capture_status_label = QtWidgets.QLabel("Idle")
         self.stack_status_label = QtWidgets.QLabel("No stack yet")
         self.track_status_label = QtWidgets.QLabel("No tracking yet")
         self.solve_status_label = QtWidgets.QLabel("No plate solve yet")
 
-        labels = [
-            ("Capture", self.capture_status_label),
-            ("Tracking", self.track_status_label),
-            ("Stacking", self.stack_status_label),
-            ("Plate Solve", self.solve_status_label),
+        status_cards = [
+            ("Capture", "Status of the live capture stream.", self.capture_status_label),
+            ("Tracking", "Latest tracking offsets and response.", self.track_status_label),
+            ("Stacking", "Current stack state and frame count.", self.stack_status_label),
+            ("Plate Solve", "Latest solution status.", self.solve_status_label),
         ]
 
-        for row, (label_text, value_label) in enumerate(labels):
-            label = QtWidgets.QLabel(label_text)
-            label_font = label.font()
-            label_font.setBold(True)
-            label.setFont(label_font)
-            status_layout.addWidget(label, row, 0)
-            status_layout.addWidget(value_label, row, 1)
+        for index, (title, description, value_label) in enumerate(status_cards):
+            card = QtWidgets.QGroupBox(title)
+            card_layout = QtWidgets.QVBoxLayout(card)
+            description_label = QtWidgets.QLabel(description)
+            description_label.setProperty("muted", True)
+            value_label.setWordWrap(True)
+            card_layout.addWidget(description_label)
+            card_layout.addWidget(value_label)
+            status_row.addWidget(card, index // 2, index % 2)
 
-        layout.addWidget(status_box)
+        layout.addLayout(status_row)
 
         controls = QtWidgets.QGroupBox("Capture control")
         controls_layout = QtWidgets.QVBoxLayout(controls)
+        controls_layout.setSpacing(10)
 
         source_layout = QtWidgets.QHBoxLayout()
         source_layout.addWidget(QtWidgets.QLabel("Source"))
@@ -172,6 +229,7 @@ class AstroStackApp(QtWidgets.QMainWindow):
 
         button_layout = QtWidgets.QHBoxLayout()
         self.btn_start = QtWidgets.QPushButton("Start capture")
+        self.btn_start.setProperty("primary", True)
         self.btn_start.clicked.connect(self.start_capture)
         self.btn_stop = QtWidgets.QPushButton("Stop")
         self.btn_stop.setEnabled(False)
@@ -189,18 +247,26 @@ class AstroStackApp(QtWidgets.QMainWindow):
         layout.addStretch()
 
     def _build_tracking_tab(self) -> None:
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
         layout = QtWidgets.QVBoxLayout(self.tab_tracking)
-        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(scroll)
+
+        content = QtWidgets.QWidget()
+        content_layout = QtWidgets.QVBoxLayout(content)
+        content_layout.setContentsMargins(20, 20, 20, 20)
+        content_layout.setSpacing(12)
+        scroll.setWidget(content)
 
         heading = QtWidgets.QLabel("Tracking configuration")
-        heading_font = heading.font()
-        heading_font.setPointSize(14)
-        heading_font.setBold(True)
-        heading.setFont(heading_font)
-        layout.addWidget(heading)
+        heading.setProperty("sectionTitle", True)
+        content_layout.addWidget(heading)
 
         config_box = QtWidgets.QGroupBox("Phase correlation preprocessing")
         config_layout = QtWidgets.QGridLayout(config_box)
+        config_layout.setHorizontalSpacing(16)
+        config_layout.setVerticalSpacing(10)
 
         self.tracking_inputs = {
             "sigma_hp": QtWidgets.QLineEdit(str(self.tracker.config.sigma_hp)),
@@ -222,10 +288,12 @@ class AstroStackApp(QtWidgets.QMainWindow):
         self.subtract_bg_checkbox.setChecked(self.tracker.config.subtract_bg_ema)
         config_layout.addWidget(self.subtract_bg_checkbox, 0, 2, 1, 1)
 
-        layout.addWidget(config_box)
+        content_layout.addWidget(config_box)
 
         arduino_box = QtWidgets.QGroupBox("Arduino mount")
         arduino_layout = QtWidgets.QGridLayout(arduino_box)
+        arduino_layout.setHorizontalSpacing(16)
+        arduino_layout.setVerticalSpacing(10)
 
         self.arduino_port_input = QtWidgets.QLineEdit(self.arduino.port)
         self.arduino_baud_input = QtWidgets.QLineEdit(str(self.arduino.baud))
@@ -246,36 +314,45 @@ class AstroStackApp(QtWidgets.QMainWindow):
         arduino_layout.addWidget(self.arduino_stop_button, 1, 2, 1, 1)
         arduino_layout.addWidget(self.arduino_status_label, 1, 3, 1, 2)
 
-        layout.addWidget(arduino_box)
+        content_layout.addWidget(arduino_box)
 
         apply_button = QtWidgets.QPushButton("Apply tracking settings")
+        apply_button.setProperty("primary", True)
         apply_button.clicked.connect(self.apply_tracking)
-        layout.addWidget(apply_button, alignment=QtCore.Qt.AlignLeft)
+        content_layout.addWidget(apply_button, alignment=QtCore.Qt.AlignLeft)
 
         reset_button = QtWidgets.QPushButton("Reset keyframe")
         reset_button.clicked.connect(self.reset_tracking_keyframe)
-        layout.addWidget(reset_button, alignment=QtCore.Qt.AlignLeft)
+        content_layout.addWidget(reset_button, alignment=QtCore.Qt.AlignLeft)
 
         status_box = QtWidgets.QGroupBox("Tracking telemetry")
         status_layout = QtWidgets.QVBoxLayout(status_box)
         self.track_detail_label = QtWidgets.QLabel("Waiting for capture…")
         status_layout.addWidget(self.track_detail_label)
-        layout.addWidget(status_box)
-        layout.addStretch()
+        content_layout.addWidget(status_box)
+        content_layout.addStretch()
 
     def _build_stacking_tab(self) -> None:
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
         layout = QtWidgets.QVBoxLayout(self.tab_stacking)
-        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(scroll)
+
+        content = QtWidgets.QWidget()
+        content_layout = QtWidgets.QVBoxLayout(content)
+        content_layout.setContentsMargins(20, 20, 20, 20)
+        content_layout.setSpacing(12)
+        scroll.setWidget(content)
 
         heading = QtWidgets.QLabel("Stacking configuration")
-        heading_font = heading.font()
-        heading_font.setPointSize(14)
-        heading_font.setBold(True)
-        heading.setFont(heading_font)
-        layout.addWidget(heading)
+        heading.setProperty("sectionTitle", True)
+        content_layout.addWidget(heading)
 
         config_box = QtWidgets.QGroupBox("Noise-aware stacking")
         config_layout = QtWidgets.QGridLayout(config_box)
+        config_layout.setHorizontalSpacing(16)
+        config_layout.setVerticalSpacing(10)
 
         self.stacking_inputs = {
             "sigma_bg": QtWidgets.QLineEdit(str(self.stacker.config.sigma_bg)),
@@ -299,17 +376,18 @@ class AstroStackApp(QtWidgets.QMainWindow):
         self._add_form_row(config_layout, "Hot-pixel Z", self.stacking_inputs["hot_z"], 7)
         self._add_form_row(config_layout, "Hot-pixel max", self.stacking_inputs["hot_max"], 8)
 
-        layout.addWidget(config_box)
+        content_layout.addWidget(config_box)
 
         apply_button = QtWidgets.QPushButton("Apply stacking settings")
+        apply_button.setProperty("primary", True)
         apply_button.clicked.connect(self.apply_stacking)
-        layout.addWidget(apply_button, alignment=QtCore.Qt.AlignLeft)
+        content_layout.addWidget(apply_button, alignment=QtCore.Qt.AlignLeft)
 
         status_box = QtWidgets.QGroupBox("Stack status")
         status_layout = QtWidgets.QVBoxLayout(status_box)
         self.stack_detail_label = QtWidgets.QLabel("Waiting for capture…")
         status_layout.addWidget(self.stack_detail_label)
-        layout.addWidget(status_box)
+        content_layout.addWidget(status_box)
 
         preview_box = QtWidgets.QGroupBox("Preview")
         preview_layout = QtWidgets.QVBoxLayout(preview_box)
@@ -322,27 +400,35 @@ class AstroStackApp(QtWidgets.QMainWindow):
             QtWidgets.QSizePolicy.Expanding,
         )
         preview_layout.addWidget(self.preview_label)
-        layout.addWidget(preview_box)
+        content_layout.addWidget(preview_box)
 
         save_button = QtWidgets.QPushButton("Save stacked image")
         save_button.clicked.connect(self.save_stack)
-        layout.addWidget(save_button, alignment=QtCore.Qt.AlignLeft)
-        layout.addStretch()
-        layout.setStretch(4, 1)
+        content_layout.addWidget(save_button, alignment=QtCore.Qt.AlignLeft)
+        content_layout.addStretch()
+        content_layout.setStretch(4, 1)
 
     def _build_plate_tab(self) -> None:
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
         layout = QtWidgets.QVBoxLayout(self.tab_solve)
-        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(scroll)
+
+        content = QtWidgets.QWidget()
+        content_layout = QtWidgets.QVBoxLayout(content)
+        content_layout.setContentsMargins(20, 20, 20, 20)
+        content_layout.setSpacing(12)
+        scroll.setWidget(content)
 
         heading = QtWidgets.QLabel("Plate solving")
-        heading_font = heading.font()
-        heading_font.setPointSize(14)
-        heading_font.setBold(True)
-        heading.setFont(heading_font)
-        layout.addWidget(heading)
+        heading.setProperty("sectionTitle", True)
+        content_layout.addWidget(heading)
 
         settings_box = QtWidgets.QGroupBox("Solve settings")
         settings_layout = QtWidgets.QGridLayout(settings_box)
+        settings_layout.setHorizontalSpacing(16)
+        settings_layout.setVerticalSpacing(10)
 
         self.solve_inputs = {
             "target": QtWidgets.QLineEdit("M42"),
@@ -360,20 +446,21 @@ class AstroStackApp(QtWidgets.QMainWindow):
         self._add_form_row(settings_layout, "Focal length (mm)", self.solve_inputs["focal_mm"], 4)
         self._add_form_row(settings_layout, "Max Gaia sources", self.solve_inputs["max_gaia"], 5)
 
-        layout.addWidget(settings_box)
+        content_layout.addWidget(settings_box)
 
         detect_row = QtWidgets.QHBoxLayout()
         self.detect_button = QtWidgets.QPushButton("Detect stars")
+        self.detect_button.setProperty("primary", True)
         self.detect_button.clicked.connect(self.detect_stars)
         detect_row.addWidget(self.detect_button)
         detect_row.addStretch()
-        layout.addLayout(detect_row)
+        content_layout.addLayout(detect_row)
 
         detect_box = QtWidgets.QGroupBox("Detection summary")
         detect_layout = QtWidgets.QVBoxLayout(detect_box)
         self.detect_detail_label = QtWidgets.QLabel("No detections yet.")
         detect_layout.addWidget(self.detect_detail_label)
-        layout.addWidget(detect_box)
+        content_layout.addWidget(detect_box)
 
         preview_box = QtWidgets.QGroupBox("Detection preview")
         preview_layout = QtWidgets.QVBoxLayout(preview_box)
@@ -385,36 +472,45 @@ class AstroStackApp(QtWidgets.QMainWindow):
             QtWidgets.QSizePolicy.Expanding,
         )
         preview_layout.addWidget(self.detect_preview_label)
-        layout.addWidget(preview_box)
+        content_layout.addWidget(preview_box)
 
         self.solve_button = QtWidgets.QPushButton("Solve from current stack")
+        self.solve_button.setProperty("primary", True)
         self.solve_button.clicked.connect(self.start_plate_solve)
-        layout.addWidget(self.solve_button, alignment=QtCore.Qt.AlignLeft)
+        content_layout.addWidget(self.solve_button, alignment=QtCore.Qt.AlignLeft)
 
         self.accept_button = QtWidgets.QPushButton("Accept solution for GoTo")
         self.accept_button.clicked.connect(self.accept_plate_solution)
-        layout.addWidget(self.accept_button, alignment=QtCore.Qt.AlignLeft)
+        content_layout.addWidget(self.accept_button, alignment=QtCore.Qt.AlignLeft)
 
         status_box = QtWidgets.QGroupBox("Solution summary")
         status_layout = QtWidgets.QVBoxLayout(status_box)
         self.solve_detail_label = QtWidgets.QLabel("No solution yet.")
         status_layout.addWidget(self.solve_detail_label)
-        layout.addWidget(status_box)
-        layout.addStretch()
+        content_layout.addWidget(status_box)
+        content_layout.addStretch()
 
     def _build_goto_tab(self) -> None:
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
         layout = QtWidgets.QVBoxLayout(self.tab_goto)
-        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(scroll)
+
+        content = QtWidgets.QWidget()
+        content_layout = QtWidgets.QVBoxLayout(content)
+        content_layout.setContentsMargins(20, 20, 20, 20)
+        content_layout.setSpacing(12)
+        scroll.setWidget(content)
 
         heading = QtWidgets.QLabel("GoTo helper")
-        heading_font = heading.font()
-        heading_font.setPointSize(14)
-        heading_font.setBold(True)
-        heading.setFont(heading_font)
-        layout.addWidget(heading)
+        heading.setProperty("sectionTitle", True)
+        content_layout.addWidget(heading)
 
         goto_box = QtWidgets.QGroupBox("Target offsets")
         goto_layout = QtWidgets.QGridLayout(goto_box)
+        goto_layout.setHorizontalSpacing(16)
+        goto_layout.setVerticalSpacing(10)
 
         self.goto_inputs = {
             "target_ra": QtWidgets.QLineEdit("83.8221"),
@@ -424,14 +520,17 @@ class AstroStackApp(QtWidgets.QMainWindow):
         self._add_form_row(goto_layout, "Target RA (deg)", self.goto_inputs["target_ra"], 0)
         self._add_form_row(goto_layout, "Target Dec (deg)", self.goto_inputs["target_dec"], 1)
 
-        layout.addWidget(goto_box)
+        content_layout.addWidget(goto_box)
 
         compute_button = QtWidgets.QPushButton("Compute offset")
+        compute_button.setProperty("primary", True)
         compute_button.clicked.connect(self.compute_goto_offset)
-        layout.addWidget(compute_button, alignment=QtCore.Qt.AlignLeft)
+        content_layout.addWidget(compute_button, alignment=QtCore.Qt.AlignLeft)
 
         mount_box = QtWidgets.QGroupBox("Mount calibration")
         mount_layout = QtWidgets.QGridLayout(mount_box)
+        mount_layout.setHorizontalSpacing(16)
+        mount_layout.setVerticalSpacing(10)
         self.microstep_az_input = QtWidgets.QLineEdit(str(self.mount.state.ms_az))
         self.microstep_alt_input = QtWidgets.QLineEdit(str(self.mount.state.ms_alt))
         self.sign_az_checkbox = QtWidgets.QCheckBox("Invert AZ sign")
@@ -445,10 +544,12 @@ class AstroStackApp(QtWidgets.QMainWindow):
         self.apply_mount_button = QtWidgets.QPushButton("Apply mount settings")
         self.apply_mount_button.clicked.connect(self.apply_mount_settings)
         mount_layout.addWidget(self.apply_mount_button, 2, 0, 1, 3)
-        layout.addWidget(mount_box)
+        content_layout.addWidget(mount_box)
 
         objects_box = QtWidgets.QGroupBox("Objects now (Alt/Az)")
         objects_layout = QtWidgets.QGridLayout(objects_box)
+        objects_layout.setHorizontalSpacing(16)
+        objects_layout.setVerticalSpacing(10)
         self.refresh_objects_button = QtWidgets.QPushButton("Refresh objects")
         self.refresh_objects_button.clicked.connect(self.refresh_objects)
         self.objects_combo = QtWidgets.QComboBox()
@@ -464,10 +565,12 @@ class AstroStackApp(QtWidgets.QMainWindow):
         objects_layout.addWidget(QtWidgets.QLabel("ALT delay (us)"), 1, 2)
         objects_layout.addWidget(self.goto_delay_alt_input, 1, 3)
         objects_layout.addWidget(self.goto_objects_button, 2, 0, 1, 4)
-        layout.addWidget(objects_box)
+        content_layout.addWidget(objects_box)
 
         manual_box = QtWidgets.QGroupBox("Manual mount movement")
         manual_layout = QtWidgets.QGridLayout(manual_box)
+        manual_layout.setHorizontalSpacing(16)
+        manual_layout.setVerticalSpacing(10)
         self.manual_steps_az_input = QtWidgets.QLineEdit("200")
         self.manual_delay_az_input = QtWidgets.QLineEdit("1500")
         self.manual_steps_alt_input = QtWidgets.QLineEdit("200")
@@ -494,14 +597,14 @@ class AstroStackApp(QtWidgets.QMainWindow):
         manual_layout.addWidget(self.manual_delay_alt_input, 2, 3)
         manual_layout.addWidget(self.manual_alt_up_button, 3, 0)
         manual_layout.addWidget(self.manual_alt_down_button, 3, 1)
-        layout.addWidget(manual_box)
+        content_layout.addWidget(manual_box)
 
         status_box = QtWidgets.QGroupBox("GoTo result")
         status_layout = QtWidgets.QVBoxLayout(status_box)
         self.goto_detail_label = QtWidgets.QLabel("Need a plate solution to compute offsets.")
         status_layout.addWidget(self.goto_detail_label)
-        layout.addWidget(status_box)
-        layout.addStretch()
+        content_layout.addWidget(status_box)
+        content_layout.addStretch()
 
     def _build_logs_tab(self) -> None:
         layout = QtWidgets.QVBoxLayout(self.tab_logs)

@@ -5,16 +5,21 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .plate_solve_service import PlateSolveResult, PlateSolveSettings, solve_from_stack
-from .preprocessing import StretchConfig, stretch_to_u8
-from .simulations import StarFieldSimulator
-from .stacking import StackingConfig, StackingEngine
-from .tracking import TrackingConfig, TrackingEngine
+PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+if str(PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_ROOT))
+
+from astrostack.plate_solve_service import PlateSolveResult, PlateSolveSettings, solve_from_stack
+from astrostack.preprocessing import StretchConfig, stretch_to_u8
+from astrostack.simulations import StarFieldSimulator
+from astrostack.stacking import StackingConfig, StackingEngine
+from astrostack.tracking import TrackingConfig, TrackingEngine
 
 
 @dataclass

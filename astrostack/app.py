@@ -1,3 +1,9 @@
+"""AstroStack GUI entrypoint.
+
+Uso:
+  python -m astrostack.app
+"""
+
 from __future__ import annotations
 
 import queue
@@ -5,22 +11,17 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
-PACKAGE_ROOT = Path(__file__).resolve().parent.parent
-if str(PACKAGE_ROOT) not in sys.path:
-    sys.path.insert(0, str(PACKAGE_ROOT))
-
-from astrostack.plate_solve_service import PlateSolveResult, PlateSolveSettings, solve_from_stack
-from astrostack.preprocessing import StretchConfig, stretch_to_u8
-from astrostack.simulations import StarFieldSimulator
-from astrostack.arduino import ArduinoController
-from astrostack.stacking import StackingConfig, StackingEngine
-from astrostack.tracking import TrackingConfig, TrackingEngine
+from .arduino import ArduinoController
+from .plate_solve_service import PlateSolveResult, PlateSolveSettings, solve_from_stack
+from .preprocessing import StretchConfig, stretch_to_u8
+from .simulations import StarFieldSimulator
+from .stacking import StackingConfig, StackingEngine
+from .tracking import TrackingConfig, TrackingEngine
 
 
 @dataclass

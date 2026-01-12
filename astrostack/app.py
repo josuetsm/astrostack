@@ -6,12 +6,17 @@ Uso:
 
 from __future__ import annotations
 
+import os
 import queue
 import sys
 import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
+
+if __package__ is None:
+    sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+    __package__ = "astrostack"
 
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
